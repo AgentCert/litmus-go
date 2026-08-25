@@ -1,0 +1,20 @@
+# Slim image for the itbench custom fault catalog (bin/itbench-experiment). Unlike the
+# upstream go-runner image (build/Dockerfile), none of these faults exec into a target
+# container, manipulate node-level network/cgroups, or need a helper pod with stress-ng/
+# tc/iptables/toxiproxy -- they are pure Kubernetes-API mutations via client-go's dynamic
+# client (see litmus-go/pkg/itbench/common), so a static binary on a distroless base is
+# sufficient.
+FROM golang:1.22 AS builder
+
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
+WORKDIR /litmus-go
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /output/itbench-experiment ./bin/itbench-experiment
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=builder /output/itbench-experiment /itbench-experiment
+USER nonroot:nonroot
+ENTRYPOINT ["/itbench-experiment"]
