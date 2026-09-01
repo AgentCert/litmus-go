@@ -40,6 +40,8 @@ import (
 	apiServerSurge "github.com/litmuschaos/litmus-go/experiments/itbench/kubernetes-api-server-request-surge/experiment"
 	priorityPreemption "github.com/litmuschaos/litmus-go/experiments/itbench/priority-kubernetes-workload-priority-preemption/experiment"
 	podFailure "github.com/litmuschaos/litmus-go/experiments/itbench/chaos-mesh-pod-failure-replacement/experiment"
+	uninstallAgent "github.com/litmuschaos/litmus-go/experiments/itbench/uninstall-agent/experiment"
+	uninstallApplication "github.com/litmuschaos/litmus-go/experiments/itbench/uninstall-application/experiment"
 )
 
 func main() {
@@ -115,6 +117,10 @@ func main() {
 		priorityPreemption.Run(ctx, cs)
 	case "chaos-mesh-pod-failure-replacement":
 		podFailure.Run(ctx, cs)
+	case "uninstall-agent":
+		uninstallAgent.Run(ctx, cs)
+	case "uninstall-application":
+		uninstallApplication.Run(ctx, cs)
 	default:
 		log.Fatalf("Unsupported itbench chaos experiment: %v", *experimentName)
 	}
