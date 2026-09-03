@@ -90,7 +90,7 @@ func applyFieldPatch(ctx context.Context, cs clients.ClientSets, chaosDetails *t
 		return fmt.Errorf("patching %s: %w", jsonPointerPath, err)
 	}
 
-	Sleep(ctx, chaosDetails.ChaosDuration)
+	HoldChaos(ctx, chaosDetails)
 
 	revertOp, skip, err := buildRevertOp(ctx, cs, gvr, namespace, name, fieldPath, jsonPointerPath, original, found)
 	if err != nil {
@@ -147,7 +147,7 @@ func applyMultiFieldPatch(ctx context.Context, cs clients.ClientSets, chaosDetai
 		return fmt.Errorf("patching fields: %w", err)
 	}
 
-	Sleep(ctx, chaosDetails.ChaosDuration)
+	HoldChaos(ctx, chaosDetails)
 
 	var current *unstructured.Unstructured
 	var revertOps []jsonPatchOp
@@ -283,7 +283,7 @@ func MergeField(ctx context.Context, cs clients.ClientSets, gvr schema.GroupVers
 		return fmt.Errorf("patching %s: %w", jsonPointerPath, err)
 	}
 
-	Sleep(ctx, chaosDetails.ChaosDuration)
+	HoldChaos(ctx, chaosDetails)
 
 	revertOp, skip, err := buildRevertOp(ctx, cs, gvr, namespace, name, fieldPath, jsonPointerPath, original, found)
 	if err != nil {
@@ -348,7 +348,7 @@ func MergeWorkloadMapField(ctx context.Context, cs clients.ClientSets, chaosDeta
 		return fmt.Errorf("patching %s: %w", jsonPointerPath, err)
 	}
 
-	Sleep(ctx, chaosDetails.ChaosDuration)
+	HoldChaos(ctx, chaosDetails)
 
 	revertOp, skip, err := buildRevertOp(ctx, cs, gvr, namespace, name, fieldPath, jsonPointerPath, original, found)
 	if err != nil {

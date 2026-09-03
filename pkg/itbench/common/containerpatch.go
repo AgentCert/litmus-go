@@ -122,7 +122,7 @@ func RemoveContainerField(ctx context.Context, cs clients.ClientSets, chaosDetai
 	original, found := readNested(target.Object, nestedPath)
 	if !found {
 		log.Infof("Injecting: %s already absent on %s, nothing to remove", jsonPointerPath, containerName)
-		Sleep(ctx, chaosDetails.ChaosDuration)
+		HoldChaos(ctx, chaosDetails)
 		return nil
 	}
 
@@ -135,7 +135,7 @@ func RemoveContainerField(ctx context.Context, cs clients.ClientSets, chaosDetai
 		return fmt.Errorf("removing %s: %w", jsonPointerPath, err)
 	}
 
-	Sleep(ctx, chaosDetails.ChaosDuration)
+	HoldChaos(ctx, chaosDetails)
 
 	log.Infof("Reverting: restoring %s on %s", jsonPointerPath, containerName)
 	restorePatch, err := json.Marshal([]jsonPatchOp{{Op: "add", Path: jsonPointerPath, Value: original}})
@@ -218,7 +218,7 @@ func MergeContainerMapFields(ctx context.Context, cs clients.ClientSets, chaosDe
 		return fmt.Errorf("patching fields: %w", err)
 	}
 
-	Sleep(ctx, chaosDetails.ChaosDuration)
+	HoldChaos(ctx, chaosDetails)
 
 	revertOps := make([]jsonPatchOp, len(items))
 	for i, it := range items {
@@ -285,7 +285,7 @@ func AppendAndRemoveInitContainer(ctx context.Context, cs clients.ClientSets, ch
 		return fmt.Errorf("appending initContainer: %w", err)
 	}
 
-	Sleep(ctx, chaosDetails.ChaosDuration)
+	HoldChaos(ctx, chaosDetails)
 
 	removePath := fmt.Sprintf("/spec/template/spec/initContainers/%d", origCount)
 	log.Infof("Reverting: removing appended initContainer at index %d", origCount)
@@ -357,7 +357,7 @@ func AppendAndRemoveWorkloadArrayItems(ctx context.Context, cs clients.ClientSet
 		return fmt.Errorf("appending array items: %w", err)
 	}
 
-	Sleep(ctx, chaosDetails.ChaosDuration)
+	HoldChaos(ctx, chaosDetails)
 
 	revertOps := make([]jsonPatchOp, len(specs))
 	for i, spec := range specs {
