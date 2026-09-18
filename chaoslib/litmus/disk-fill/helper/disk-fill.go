@@ -231,22 +231,37 @@ func filterUsedEphemeralStorage(ephemeralStorageDetails string) (int, error) {
 	return ephemeralStorageSize, err
 }
 
-// getSizeToBeFilled generate the ephemeral storage size need to be filled
-func getSizeToBeFilled(experimentsDetails *experimentTypes.ExperimentDetails, usedEphemeralStorageSize int, ephemeralStorageLimit int) int {
+// getSizeToBeFilled generate the ephemeral storage size need to be filled.
+// Both parses below previously discarded their error, so an unset or non-numeric
+// tunable silently became 0 — making requirementToBeFill 0, needToBeFilled
+// negative, and the whole fault a no-op that still reported success.
+func getSizeToBeFilled(experimentsDetails *experimentTypes.ExperimentDetails, usedEphemeralStorageSize int, ephemeralStorageLimit int) (int, error) {
 	var requirementToBeFill int
 
 	switch ephemeralStorageLimit {
 	case 0:
-		ephemeralStorageMebibytes, _ := strconv.Atoi(experimentsDetails.EphemeralStorageMebibytes)
+		ephemeralStorageMebibytes, err := strconv.Atoi(strings.TrimSpace(experimentsDetails.EphemeralStorageMebibytes))
+		if err != nil || ephemeralStorageMebibytes <= 0 {
+			return 0, cerrors.Error{
+				ErrorCode: cerrors.ErrorTypeHelper,
+				Reason:    fmt.Sprintf("EPHEMERAL_STORAGE_MEBIBYTES must be a positive integer when the target container sets no ephemeral-storage limit, got %q", experimentsDetails.EphemeralStorageMebibytes),
+			}
+		}
 		requirementToBeFill = ephemeralStorageMebibytes * 1024
 	default:
 		// deriving size need to be filled from the used size & requirement size to fill
-		fillPercentage, _ := strconv.Atoi(experimentsDetails.FillPercentage)
+		fillPercentage, err := strconv.Atoi(strings.TrimSpace(experimentsDetails.FillPercentage))
+		if err != nil || fillPercentage <= 0 || fillPercentage > 100 {
+			return 0, cerrors.Error{
+				ErrorCode: cerrors.ErrorTypeHelper,
+				Reason:    fmt.Sprintf("FILL_PERCENTAGE must be an integer in 1..100, got %q", experimentsDetails.FillPercentage),
+			}
+		}
 		requirementToBeFill = (ephemeralStorageLimit * fillPercentage) / 100
 	}
 
 	needToBeFilled := requirementToBeFill - usedEphemeralStorageSize
-	return needToBeFilled
+	return needToBeFilled, nil
 }
 
 // revertDiskFill will delete the target pod if target pod is evicted
@@ -333,12 +348,27 @@ func getDiskSizeToFill(t targetDetails, experimentsDetails *experimentTypes.Expe
 		return 0, stacktrace.Propagate(err, "could not get ephemeral storage attributes")
 	}
 
-	if ephemeralStorageLimit == 0 && experimentsDetails.EphemeralStorageMebibytes == "0" {
+	// "" and "0" both mean "not provided": types.Getenv returns "" for an absent
+	// variable, so testing only against "0" left this guard unreachable and let the
+	// fault fall through to a negative fill size and a false success.
+	mebibytes := strings.TrimSpace(experimentsDetails.EphemeralStorageMebibytes)
+	if ephemeralStorageLimit == 0 && (mebibytes == "" || mebibytes == "0") {
 		return 0, cerrors.Error{ErrorCode: cerrors.ErrorTypeHelper, Source: t.Source, Target: fmt.Sprintf("{podName: %s, namespace: %s}", t.Name, t.Namespace), Reason: "either provide ephemeral storage limit inside target container or define EPHEMERAL_STORAGE_MEBIBYTES ENV"}
 	}
 
 	// deriving the ephemeral storage size to be filled
-	sizeTobeFilled := getSizeToBeFilled(experimentsDetails, usedEphemeralStorageSize, int(ephemeralStorageLimit))
+	sizeTobeFilled, err := getSizeToBeFilled(experimentsDetails, usedEphemeralStorageSize, int(ephemeralStorageLimit))
+	if err != nil {
+		return 0, stacktrace.Propagate(err, "could not derive the size to be filled")
+	}
+	if sizeTobeFilled <= 0 {
+		return 0, cerrors.Error{
+			ErrorCode: cerrors.ErrorTypeHelper,
+			Source:    t.Source,
+			Target:    fmt.Sprintf("{podName: %s, namespace: %s}", t.Name, t.Namespace),
+			Reason:    fmt.Sprintf("no disk space left to fill: target already uses %dKB of the %dKB requested — raise FILL_PERCENTAGE or EPHEMERAL_STORAGE_MEBIBYTES", usedEphemeralStorageSize, sizeTobeFilled+usedEphemeralStorageSize),
+		}
+	}
 
 	return sizeTobeFilled, nil
 }

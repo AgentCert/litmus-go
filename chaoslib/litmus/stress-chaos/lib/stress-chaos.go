@@ -188,6 +188,14 @@ func createHelperPod(ctx context.Context, experimentsDetails *experimentTypes.Ex
 	privilegedEnable := true
 	terminationGracePeriodSeconds := int64(experimentsDetails.TerminationGracePeriodSeconds)
 
+	// Correct the container-runtime socket for the node this helper will land on.
+	// Every chart ships SOCKET_PATH=/run/containerd/containerd.sock, which is right
+	// for KinD/kubeadm but wrong on k3s — there the generic socket connects yet
+	// reports "container not found" for every ID, so GetPID fails and the fault dies
+	// before injecting. Resolved per node (not once per experiment) so a mixed-runtime
+	// cluster is handled correctly; an explicit non-default SOCKET_PATH always wins.
+	experimentsDetails.SocketPath = common.ResolveSocketPathForNode(ctx, clients, nodeName, experimentsDetails.SocketPath)
+
 	helperPod := &apiv1.Pod{
 		ObjectMeta: v1.ObjectMeta{
 			GenerateName: experimentsDetails.ExperimentName + "-helper-",

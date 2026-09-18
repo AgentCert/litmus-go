@@ -92,7 +92,10 @@ func applyFieldPatch(ctx context.Context, cs clients.ClientSets, chaosDetails *t
 
 	HoldChaos(ctx, chaosDetails)
 
-	revertOp, skip, err := buildRevertOp(ctx, cs, gvr, namespace, name, fieldPath, jsonPointerPath, original, found)
+	revertCtx, cancel := RevertContext()
+	defer cancel()
+
+	revertOp, skip, err := buildRevertOp(revertCtx, cs, gvr, namespace, name, fieldPath, jsonPointerPath, original, found)
 	if err != nil {
 		return err
 	}
@@ -105,7 +108,7 @@ func applyFieldPatch(ctx context.Context, cs clients.ClientSets, chaosDetails *t
 		return err
 	}
 	log.Infof("Reverting: restoring %s", jsonPointerPath)
-	if err := JSONPatch(ctx, cs, gvr, namespace, name, revertPatch); err != nil {
+	if err := JSONPatch(revertCtx, cs, gvr, namespace, name, revertPatch); err != nil {
 		return fmt.Errorf("reverting %s: %w", jsonPointerPath, err)
 	}
 	return nil
@@ -149,6 +152,9 @@ func applyMultiFieldPatch(ctx context.Context, cs clients.ClientSets, chaosDetai
 
 	HoldChaos(ctx, chaosDetails)
 
+	revertCtx, cancel := RevertContext()
+	defer cancel()
+
 	var current *unstructured.Unstructured
 	var revertOps []jsonPatchOp
 	for i, f := range fields {
@@ -162,7 +168,7 @@ func applyMultiFieldPatch(ctx context.Context, cs clients.ClientSets, chaosDetai
 		// added it, which would make a blind "remove" fail (RFC 6902 requires the
 		// target to currently exist).
 		if current == nil {
-			current, err = cs.DynamicClient.Resource(gvr).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+			current, err = cs.DynamicClient.Resource(gvr).Namespace(namespace).Get(revertCtx, name, metav1.GetOptions{})
 			if err != nil {
 				return fmt.Errorf("re-fetching %s/%s to check current state before revert: %w", gvr.Resource, name, err)
 			}
@@ -180,7 +186,7 @@ func applyMultiFieldPatch(ctx context.Context, cs clients.ClientSets, chaosDetai
 		return err
 	}
 	log.Infof("Reverting: restoring %d field(s)", len(revertOps))
-	if err := JSONPatch(ctx, cs, gvr, namespace, name, revertPatch); err != nil {
+	if err := JSONPatch(revertCtx, cs, gvr, namespace, name, revertPatch); err != nil {
 		return fmt.Errorf("reverting fields: %w", err)
 	}
 	return nil
@@ -285,7 +291,10 @@ func MergeField(ctx context.Context, cs clients.ClientSets, gvr schema.GroupVers
 
 	HoldChaos(ctx, chaosDetails)
 
-	revertOp, skip, err := buildRevertOp(ctx, cs, gvr, namespace, name, fieldPath, jsonPointerPath, original, found)
+	revertCtx, cancel := RevertContext()
+	defer cancel()
+
+	revertOp, skip, err := buildRevertOp(revertCtx, cs, gvr, namespace, name, fieldPath, jsonPointerPath, original, found)
 	if err != nil {
 		return err
 	}
@@ -298,7 +307,7 @@ func MergeField(ctx context.Context, cs clients.ClientSets, gvr schema.GroupVers
 		return err
 	}
 	log.Infof("Reverting: restoring %s", jsonPointerPath)
-	if err := JSONPatch(ctx, cs, gvr, namespace, name, revertPatch); err != nil {
+	if err := JSONPatch(revertCtx, cs, gvr, namespace, name, revertPatch); err != nil {
 		return fmt.Errorf("reverting %s: %w", jsonPointerPath, err)
 	}
 	return nil
@@ -350,7 +359,10 @@ func MergeWorkloadMapField(ctx context.Context, cs clients.ClientSets, chaosDeta
 
 	HoldChaos(ctx, chaosDetails)
 
-	revertOp, skip, err := buildRevertOp(ctx, cs, gvr, namespace, name, fieldPath, jsonPointerPath, original, found)
+	revertCtx, cancel := RevertContext()
+	defer cancel()
+
+	revertOp, skip, err := buildRevertOp(revertCtx, cs, gvr, namespace, name, fieldPath, jsonPointerPath, original, found)
 	if err != nil {
 		return err
 	}
@@ -363,7 +375,7 @@ func MergeWorkloadMapField(ctx context.Context, cs clients.ClientSets, chaosDeta
 		return err
 	}
 	log.Infof("Reverting: restoring %s", jsonPointerPath)
-	if err := JSONPatch(ctx, cs, gvr, namespace, name, revertPatch); err != nil {
+	if err := JSONPatch(revertCtx, cs, gvr, namespace, name, revertPatch); err != nil {
 		return fmt.Errorf("reverting %s: %w", jsonPointerPath, err)
 	}
 	return nil

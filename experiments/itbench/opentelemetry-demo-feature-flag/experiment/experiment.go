@@ -30,6 +30,9 @@ func Run(ctx context.Context, cs clients.ClientSets) {
 // appkind is CRD-validated to a fixed enum and rejects "configmap", so this fault always
 // hardcodes the real target kind, trusting TARGETS only for namespace.
 func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.ChaosDetails) error {
+	if len(chaosDetails.AppDetail) == 0 {
+		return fmt.Errorf("no target resolved: TARGETS env var was empty/unset")
+	}
 	flagName := os.Getenv("FLAG_NAME")
 	flagState := os.Getenv("FLAG_STATE")
 	flagRevertState := os.Getenv("FLAG_REVERT_STATE")
@@ -47,11 +50,16 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 		return fmt.Errorf("ConfigMap %s has no %q data key", configMapName, dataKey)
 	}
 
-	origVariant, injected, err := setDefaultVariant(current, flagName, flagState)
+	origVariant, origFound, injected, err := setDefaultVariant(current, flagName, flagState)
 	if err != nil {
 		return err
 	}
-	if origVariant == "" {
+	if !origFound {
+		// The flag had no defaultVariant at all. Reverting to "" would write a value that was
+		// never there and leave flagd misconfigured for every later run.
+		if flagRevertState == "" {
+			return fmt.Errorf("flag %q has no defaultVariant and FLAG_REVERT_STATE is unset -- there is no value to revert to", flagName)
+		}
 		origVariant = flagRevertState
 	}
 	log.Infof("flag=%s originalDefaultVariant=%s", flagName, origVariant)
@@ -61,39 +69,43 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 		return err
 	}
 
-	itbench.Sleep(ctx, chaosDetails.ChaosDuration)
+	itbench.HoldChaos(ctx, chaosDetails)
 
-	_, reverted, err := setDefaultVariant(injected, flagName, origVariant)
+	revertCtx, cancel := itbench.RevertContext()
+	defer cancel()
+
+	_, _, reverted, err := setDefaultVariant(injected, flagName, origVariant)
 	if err != nil {
 		return err
 	}
 	log.Infof("Reverting: restoring %s.defaultVariant=%s", flagName, origVariant)
-	return patchConfigMapData(ctx, cmClient, configMapName, reverted)
+	return patchConfigMapData(revertCtx, cmClient, configMapName, reverted)
 }
 
 // setDefaultVariant parses flagdJSON, sets flags[flagName].defaultVariant=newVariant, and
-// returns (previous variant, re-serialized JSON). Fails if flagName isn't present.
-func setDefaultVariant(flagdJSON, flagName, newVariant string) (string, string, error) {
+// returns the previous variant, whether it was present at all, and the re-serialized JSON.
+// Fails if flagName isn't present.
+func setDefaultVariant(flagdJSON, flagName, newVariant string) (origVariant string, origFound bool, out string, err error) {
 	var doc map[string]interface{}
 	if err := json.Unmarshal([]byte(flagdJSON), &doc); err != nil {
-		return "", "", fmt.Errorf("parsing demo.flagd.json: %w", err)
+		return "", false, "", fmt.Errorf("parsing demo.flagd.json: %w", err)
 	}
 	flags, ok := doc["flags"].(map[string]interface{})
 	if !ok {
-		return "", "", fmt.Errorf("demo.flagd.json has no top-level \"flags\" object")
+		return "", false, "", fmt.Errorf("demo.flagd.json has no top-level \"flags\" object")
 	}
 	flag, ok := flags[flagName].(map[string]interface{})
 	if !ok {
-		return "", "", fmt.Errorf("flag %q not found in demo.flagd.json flags map", flagName)
+		return "", false, "", fmt.Errorf("flag %q not found in demo.flagd.json flags map", flagName)
 	}
-	origVariant, _ := flag["defaultVariant"].(string)
+	origVariant, origFound = flag["defaultVariant"].(string)
 	flag["defaultVariant"] = newVariant
 
-	out, err := json.Marshal(doc)
+	b, err := json.Marshal(doc)
 	if err != nil {
-		return "", "", err
+		return "", false, "", err
 	}
-	return origVariant, string(out), nil
+	return origVariant, origFound, string(b), nil
 }
 
 func patchConfigMapData(ctx context.Context, cmClient dynamic.ResourceInterface, name, value string) error {

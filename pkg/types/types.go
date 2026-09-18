@@ -170,6 +170,13 @@ func GetTargets(targets string) []AppDetails {
 	t := strings.Split(targets, ";")
 	for _, k := range t {
 		val := strings.Split(strings.TrimSpace(k), ":")
+		// TARGETS is "kind:namespace:[a,b]" per entry. Indexing val[2] unconditionally
+		// panicked on any entry with fewer than three colon-separated fields, which is
+		// reachable from a hand-written ChaosEngine and killed the experiment pod with
+		// an unrecovered index-out-of-range before any ChaosResult was written.
+		if len(val) < 3 {
+			continue
+		}
 		data := AppDetails{
 			Kind:      val[0],
 			Namespace: val[1],

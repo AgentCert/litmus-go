@@ -121,9 +121,10 @@ func RemoveContainerField(ctx context.Context, cs clients.ClientSets, chaosDetai
 
 	original, found := readNested(target.Object, nestedPath)
 	if !found {
-		log.Infof("Injecting: %s already absent on %s, nothing to remove", jsonPointerPath, containerName)
-		HoldChaos(ctx, chaosDetails)
-		return nil
+		// Removing the field IS the injection, so "already absent" means nothing was
+		// injected. Holding and returning nil here would report Verdict=Passed for a run
+		// that never mutated the cluster.
+		return fmt.Errorf("cannot inject: %s is already absent on container %q of %s -- nothing to remove", jsonPointerPath, containerName, name)
 	}
 
 	log.Infof("Injecting: removing %s from %s", jsonPointerPath, containerName)
@@ -137,12 +138,15 @@ func RemoveContainerField(ctx context.Context, cs clients.ClientSets, chaosDetai
 
 	HoldChaos(ctx, chaosDetails)
 
+	revertCtx, cancel := RevertContext()
+	defer cancel()
+
 	log.Infof("Reverting: restoring %s on %s", jsonPointerPath, containerName)
 	restorePatch, err := json.Marshal([]jsonPatchOp{{Op: "add", Path: jsonPointerPath, Value: original}})
 	if err != nil {
 		return err
 	}
-	if err := JSONPatch(ctx, cs, gvr, namespace, name, restorePatch); err != nil {
+	if err := JSONPatch(revertCtx, cs, gvr, namespace, name, restorePatch); err != nil {
 		return fmt.Errorf("restoring %s: %w", jsonPointerPath, err)
 	}
 	return nil
@@ -182,14 +186,17 @@ func MergeContainerMapFields(ctx context.Context, cs clients.ClientSets, chaosDe
 
 	type resolved struct {
 		jsonPointerPath string
+		revertPath      string
 		original        interface{}
 		found           bool
 		merged          map[string]interface{}
 	}
 	items := make([]resolved, len(specs))
-	injectOps := make([]jsonPatchOp, len(specs))
+	var ancestorOps []jsonPatchOp
+	mainOps := make([]jsonPatchOp, len(specs))
 	for i, spec := range specs {
-		nestedPath := append([]string{"spec", "template", "spec", "containers", fmt.Sprintf("%d", idx)}, spec.Path...)
+		containerPath := []string{"spec", "template", "spec", "containers", fmt.Sprintf("%d", idx)}
+		nestedPath := append(append([]string{}, containerPath...), spec.Path...)
 		jsonPointerPath := fmt.Sprintf("/spec/template/spec/containers/%d/%s", idx, jsonPointerJoin(spec.Path))
 		original, found := readNested(target.Object, nestedPath)
 		merged := map[string]interface{}{}
@@ -201,13 +208,29 @@ func MergeContainerMapFields(ctx context.Context, cs clients.ClientSets, chaosDe
 			}
 		}
 		merged[spec.Key] = spec.Value
-		items[i] = resolved{jsonPointerPath, original, found, merged}
+
 		op := "replace"
+		revertPath := jsonPointerPath
 		if !found {
 			op = "add"
+			// RFC 6902 "add" requires the parent to exist, so materialize any absent
+			// ancestor (e.g. resources when patching resources/limits) first, and revert
+			// by removing the shallowest one we created -- which takes the subtree with it.
+			for d := 1; d < len(spec.Path); d++ {
+				if _, ok := readNested(target.Object, append(append([]string{}, containerPath...), spec.Path[:d]...)); ok {
+					continue
+				}
+				ancestorPointer := fmt.Sprintf("/spec/template/spec/containers/%d/%s", idx, jsonPointerJoin(spec.Path[:d]))
+				ancestorOps = append(ancestorOps, jsonPatchOp{Op: "add", Path: ancestorPointer, Value: map[string]interface{}{}})
+				if revertPath == jsonPointerPath {
+					revertPath = ancestorPointer
+				}
+			}
 		}
-		injectOps[i] = jsonPatchOp{Op: op, Path: jsonPointerPath, Value: merged}
+		items[i] = resolved{jsonPointerPath, revertPath, original, found, merged}
+		mainOps[i] = jsonPatchOp{Op: op, Path: jsonPointerPath, Value: merged}
 	}
+	injectOps := append(ancestorOps, mainOps...)
 
 	injectPatch, err := json.Marshal(injectOps)
 	if err != nil {
@@ -220,12 +243,15 @@ func MergeContainerMapFields(ctx context.Context, cs clients.ClientSets, chaosDe
 
 	HoldChaos(ctx, chaosDetails)
 
+	revertCtx, cancel := RevertContext()
+	defer cancel()
+
 	revertOps := make([]jsonPatchOp, len(items))
 	for i, it := range items {
 		if it.found {
 			revertOps[i] = jsonPatchOp{Op: "replace", Path: it.jsonPointerPath, Value: it.original}
 		} else {
-			revertOps[i] = jsonPatchOp{Op: "remove", Path: it.jsonPointerPath}
+			revertOps[i] = jsonPatchOp{Op: "remove", Path: it.revertPath}
 		}
 	}
 	revertPatch, err := json.Marshal(revertOps)
@@ -233,7 +259,7 @@ func MergeContainerMapFields(ctx context.Context, cs clients.ClientSets, chaosDe
 		return err
 	}
 	log.Infof("Reverting: restoring %d map field(s)", len(specs))
-	if err := JSONPatch(ctx, cs, gvr, namespace, name, revertPatch); err != nil {
+	if err := JSONPatch(revertCtx, cs, gvr, namespace, name, revertPatch); err != nil {
 		return fmt.Errorf("reverting fields: %w", err)
 	}
 	return nil
@@ -287,13 +313,16 @@ func AppendAndRemoveInitContainer(ctx context.Context, cs clients.ClientSets, ch
 
 	HoldChaos(ctx, chaosDetails)
 
+	revertCtx, cancel := RevertContext()
+	defer cancel()
+
 	removePath := fmt.Sprintf("/spec/template/spec/initContainers/%d", origCount)
 	log.Infof("Reverting: removing appended initContainer at index %d", origCount)
 	revertPatch, err := json.Marshal([]jsonPatchOp{{Op: "remove", Path: removePath}})
 	if err != nil {
 		return err
 	}
-	if err := JSONPatch(ctx, cs, gvr, namespace, name, revertPatch); err != nil {
+	if err := JSONPatch(revertCtx, cs, gvr, namespace, name, revertPatch); err != nil {
 		return fmt.Errorf("removing appended initContainer: %w", err)
 	}
 	return nil
@@ -359,6 +388,9 @@ func AppendAndRemoveWorkloadArrayItems(ctx context.Context, cs clients.ClientSet
 
 	HoldChaos(ctx, chaosDetails)
 
+	revertCtx, cancel := RevertContext()
+	defer cancel()
+
 	revertOps := make([]jsonPatchOp, len(specs))
 	for i, spec := range specs {
 		pointerPath := fmt.Sprintf("/%s/%d", jsonPointerJoin(spec.Path), origCounts[i])
@@ -369,7 +401,7 @@ func AppendAndRemoveWorkloadArrayItems(ctx context.Context, cs clients.ClientSet
 		return err
 	}
 	log.Infof("Reverting: removing %d appended array item(s)", len(specs))
-	if err := JSONPatch(ctx, cs, gvr, namespace, name, revertPatch); err != nil {
+	if err := JSONPatch(revertCtx, cs, gvr, namespace, name, revertPatch); err != nil {
 		return fmt.Errorf("removing appended array items: %w", err)
 	}
 	return nil

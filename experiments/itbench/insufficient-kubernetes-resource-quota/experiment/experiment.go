@@ -82,38 +82,73 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 	}
 
 	log.Infof("Triggering new pod admission attempts: rollout restart %s/%s", workloadGVR.Resource, target.GetName())
-	if err := triggerRolloutRestart(ctx, cs, workloadGVR, namespace, target.GetName()); err != nil {
+	origRestartedAt, hadRestartedAt, err := triggerRolloutRestart(ctx, cs, workloadGVR, namespace, target.GetName())
+	if err != nil {
 		log.Errorf("rollout restart failed (non-fatal, quota is still applied): %v", err)
 	}
 
-	itbench.Sleep(ctx, chaosDetails.ChaosDuration)
+	itbench.HoldChaos(ctx, chaosDetails)
+
+	revertCtx, cancel := itbench.RevertContext()
+	defer cancel()
+
+	if err := restoreRestartedAt(revertCtx, cs, workloadGVR, namespace, target.GetName(), origRestartedAt, hadRestartedAt); err != nil {
+		log.Errorf("failed to restore the restartedAt annotation (non-fatal): %v", err)
+	}
 
 	if existed {
 		log.Infof("Reverting: restoring ResourceQuota %s/%s hard limits to %v", namespace, quotaName, originalHard)
-		current, err := rqClient.Get(ctx, quotaName, metav1.GetOptions{})
+		current, err := rqClient.Get(revertCtx, quotaName, metav1.GetOptions{})
 		if err != nil {
 			return fmt.Errorf("re-fetching resourcequota for revert: %w", err)
 		}
 		if err := unstructured.SetNestedMap(current.Object, originalHard, "spec", "hard"); err != nil {
 			return err
 		}
-		if _, err := rqClient.Update(ctx, current, metav1.UpdateOptions{}); err != nil {
+		if _, err := rqClient.Update(revertCtx, current, metav1.UpdateOptions{}); err != nil {
 			return fmt.Errorf("reverting resourcequota: %w", err)
 		}
 	} else {
 		log.Infof("Reverting: deleting ResourceQuota %s/%s (did not exist before injection)", namespace, quotaName)
-		if err := rqClient.Delete(ctx, quotaName, metav1.DeleteOptions{}); err != nil && !k8serrors.IsNotFound(err) {
+		if err := rqClient.Delete(revertCtx, quotaName, metav1.DeleteOptions{}); err != nil && !k8serrors.IsNotFound(err) {
 			return fmt.Errorf("deleting resourcequota: %w", err)
 		}
 	}
 	return nil
 }
 
+const restartedAtAnnotation = "kubectl.kubernetes.io/restartedAt"
+
 // triggerRolloutRestart mimics `kubectl rollout restart` by setting the standard
 // restartedAt annotation on the pod template, forcing a new ReplicaSet/Pod generation.
 // Reads-merges-writes the whole annotations map (rather than a JSON-patch "add" at a
 // possibly-absent path) since spec.template.metadata.annotations may not exist yet.
-func triggerRolloutRestart(ctx context.Context, cs clients.ClientSets, gvr schema.GroupVersionResource, namespace, name string) error {
+// Returns the annotation's prior value so the revert can put the pod template back exactly
+// as it was found.
+func triggerRolloutRestart(ctx context.Context, cs clients.ClientSets, gvr schema.GroupVersionResource, namespace, name string) (origValue string, existed bool, err error) {
+	rc := cs.DynamicClient.Resource(gvr).Namespace(namespace)
+	obj, err := rc.Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return "", false, err
+	}
+	annotations, _, _ := unstructured.NestedStringMap(obj.Object, "spec", "template", "metadata", "annotations")
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	origValue, existed = annotations[restartedAtAnnotation]
+	annotations[restartedAtAnnotation] = time.Now().Format(time.RFC3339)
+	if err := unstructured.SetNestedStringMap(obj.Object, annotations, "spec", "template", "metadata", "annotations"); err != nil {
+		return "", false, err
+	}
+	if _, err := rc.Update(ctx, obj, metav1.UpdateOptions{}); err != nil {
+		return "", false, err
+	}
+	return origValue, existed, nil
+}
+
+// restoreRestartedAt puts the restartedAt annotation back to its pre-injection state so the
+// pod template matches the chart-installed baseline again after the run.
+func restoreRestartedAt(ctx context.Context, cs clients.ClientSets, gvr schema.GroupVersionResource, namespace, name, origValue string, existed bool) error {
 	rc := cs.DynamicClient.Resource(gvr).Namespace(namespace)
 	obj, err := rc.Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
@@ -121,9 +156,13 @@ func triggerRolloutRestart(ctx context.Context, cs clients.ClientSets, gvr schem
 	}
 	annotations, _, _ := unstructured.NestedStringMap(obj.Object, "spec", "template", "metadata", "annotations")
 	if annotations == nil {
-		annotations = map[string]string{}
+		return nil
 	}
-	annotations["kubectl.kubernetes.io/restartedAt"] = time.Now().Format(time.RFC3339)
+	if existed {
+		annotations[restartedAtAnnotation] = origValue
+	} else {
+		delete(annotations, restartedAtAnnotation)
+	}
 	if err := unstructured.SetNestedStringMap(obj.Object, annotations, "spec", "template", "metadata", "annotations"); err != nil {
 		return err
 	}

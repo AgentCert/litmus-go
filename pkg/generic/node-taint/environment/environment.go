@@ -33,8 +33,18 @@ func GetENV(experimentDetails *experimentTypes.ExperimentDetails) {
 func getAppDetails() (string, string, string) {
 	targets := types.Getenv("TARGETS", "")
 	app := types.GetTargets(targets)
-	if len(app) != 0 {
-		return app[0].Namespace, app[0].Kind, app[0].Labels[0]
+	if len(app) == 0 {
+		return "", "", ""
 	}
-	return "", "", ""
+	// types.GetTargets fills Labels only when the third TARGETS field contains "=",
+	// and Names otherwise. Targeting by resource name is a first-class form, and an
+	// empty list parses to nil, so app[0].Labels[0] panicked with an unrecovered
+	// index-out-of-range before any ChaosResult could record the failure. Return an
+	// empty label instead: the caller's target selection then fails cleanly with a
+	// real message rather than crashing the experiment pod.
+	var label string
+	if len(app[0].Labels) != 0 {
+		label = app[0].Labels[0]
+	}
+	return app[0].Namespace, app[0].Kind, label
 }

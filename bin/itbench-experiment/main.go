@@ -7,6 +7,9 @@ package main
 import (
 	"context"
 	"flag"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/litmuschaos/litmus-go/pkg/clients"
 	"github.com/litmuschaos/litmus-go/pkg/log"
@@ -56,7 +59,10 @@ func main() {
 		log.Fatalf("Unable to get the kubeconfig, err: %v", err)
 	}
 
-	ctx := context.Background()
+	// Signal-aware: every fault holds on this ctx and reverts on itbench.RevertContext(),
+	// so a workflow stop ends the run without leaving the target mutated.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	switch *experimentName {
 	case "scaled-to-zero-kubernetes-workload":

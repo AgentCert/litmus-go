@@ -39,6 +39,17 @@ func PreparePodAutoscaler(ctx context.Context, experimentsDetails *experimentTyp
 	ctx, span := otel.Tracer(telemetry.TracerName).Start(ctx, "PreparePodAutoscalerFault")
 	defer span.End()
 
+	// Refuse a non-positive replica count rather than scaling the target to zero.
+	// This fault is a scale-UP: with Replicas == 0 it instead took the application
+	// fully offline, and the readiness check (ReadyReplicas != Replicas) was then
+	// satisfied at 0 == 0 — so the experiment reported Pass on a total outage.
+	if experimentsDetails.Replicas <= 0 {
+		return cerrors.Error{
+			ErrorCode: cerrors.ErrorTypeGeneric,
+			Reason:    fmt.Sprintf("REPLICA_COUNT must be a positive integer for a scale-up fault, got %d — a value of 0 would scale the target to zero and cause an outage rather than the intended chaos", experimentsDetails.Replicas),
+		}
+	}
+
 	//Waiting for the ramp time before chaos injection
 	if experimentsDetails.RampTime != 0 {
 		log.Infof("[Ramp]: Waiting for the %vs ramp time before injecting chaos", experimentsDetails.RampTime)

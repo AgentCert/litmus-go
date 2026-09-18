@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/litmuschaos/chaos-operator/api/litmuschaos/v1alpha1"
+	"github.com/litmuschaos/litmus-go/pkg/cerrors"
 	"github.com/litmuschaos/litmus-go/pkg/clients"
 	"github.com/litmuschaos/litmus-go/pkg/events"
 	"github.com/litmuschaos/litmus-go/pkg/log"
@@ -81,7 +82,29 @@ func RunMidChaosHook(ctx context.Context) {
 // probe failure here never leaves the target un-reverted.
 func HoldChaos(ctx context.Context, chaosDetails *types.ChaosDetails) {
 	Sleep(ctx, chaosDetails.ChaosDuration)
+	if ctx.Err() != nil {
+		// Aborted mid-hold: skip the recovery assertion (the agent never got its full
+		// window, so judging it here would be meaningless) and fall straight through to
+		// the caller's revert, which runs on RevertContext and therefore still works.
+		log.Info("[Abort]: hold interrupted -- skipping the recovery check and reverting the fault now")
+		return
+	}
 	RunMidChaosHook(ctx)
+}
+
+// RevertTimeout bounds each fault's post-hold revert.
+var RevertTimeout = 90 * time.Second
+
+// abortRevertGrace is how long the abort watcher lets an in-flight revert finish before
+// force-exiting. Must exceed RevertTimeout so a revert that is merely slow is not killed.
+var abortRevertGrace = RevertTimeout + 30*time.Second
+
+// RevertContext returns the context a fault's post-hold revert must use instead of the
+// experiment's own ctx. On SIGTERM the experiment ctx is cancelled, which would make every
+// revert API call fail with "context canceled" and leave the target permanently mutated --
+// a workflow stop would break the cluster rather than just ending the run.
+func RevertContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), RevertTimeout)
 }
 
 // defaultRecoveryAssertion is the built-in "did the agent restore the target?" check the
@@ -165,6 +188,48 @@ func defaultRecoveryAssertion(ctx context.Context, cs clients.ClientSets, chaosD
 	}
 }
 
+// recordAbort writes the "Stopped" ChaosResult and the abort events -- the same bookkeeping
+// litmusCommon.AbortWatcher does, minus its os.Exit(1). The exit is what makes the upstream
+// watcher unusable here: it kills the goroutine parked in HoldChaos, so the fault's revert
+// (which lives after the hold, inside InjectFunc) never runs.
+func recordAbort(cs clients.ClientSets, resultDetails *types.ResultDetails, chaosDetails *types.ChaosDetails, eventsDetails *types.EventDetails) {
+	types.SetResultAfterCompletion(resultDetails, "Stopped", "Stopped", "Chaos injection stopped!", cerrors.ErrorTypeExperimentAborted)
+	if err := result.ChaosResult(chaosDetails, cs, resultDetails, "EOT"); err != nil {
+		log.Errorf("[Abort]: Failed to update result, err: %v", err)
+	}
+
+	msg := chaosDetails.ExperimentName + " experiment has been aborted"
+	types.SetEngineEventAttributes(eventsDetails, types.Summary, msg, "Warning", chaosDetails)
+	if err := events.GenerateEvents(eventsDetails, cs, chaosDetails, "ChaosEngine"); err != nil {
+		log.Errorf("[Abort]: Failed to create chaosengine summary event, err: %v", err)
+	}
+	types.SetResultEventAttributes(eventsDetails, types.AbortVerdict, msg, "Warning", resultDetails)
+	if err := events.GenerateEvents(eventsDetails, cs, chaosDetails, "ChaosResult"); err != nil {
+		log.Errorf("[Abort]: Failed to create chaosresult abort event, err: %v", err)
+	}
+}
+
+// watchAbort is the itbench replacement for litmusCommon.AbortWatcher. On SIGTERM (relayed
+// by the signal-aware ctx the dispatcher builds) it does NOT exit immediately: the fault's
+// hold returns early, its revert runs on RevertContext, and Run() then records the abort on
+// the main goroutine. The hard exit here is only the escape hatch for a revert that hangs
+// past the grace period.
+func watchAbort(ctx context.Context, done <-chan struct{}, cs clients.ClientSets, resultDetails *types.ResultDetails, chaosDetails *types.ChaosDetails, eventsDetails *types.EventDetails) {
+	select {
+	case <-ctx.Done():
+	case <-done:
+		return
+	}
+	log.Info("[Abort]: terminated signal received -- waiting for the fault to revert before exiting")
+	select {
+	case <-done:
+	case <-time.After(abortRevertGrace):
+		log.Errorf("[Abort]: revert did not finish within %s -- exiting anyway; the target may still be mutated", abortRevertGrace)
+		recordAbort(cs, resultDetails, chaosDetails, eventsDetails)
+		os.Exit(1)
+	}
+}
+
 // Run drives the full litmus-go experiment lifecycle around a fault-specific InjectFunc:
 // env parsing, SOT/EOT ChaosResult create+patch, pre/post-chaos probes, the abort-watcher
 // goroutine, and ChaosEngine/ChaosResult events. Mirrors experiments/generic/pod-delete's
@@ -209,8 +274,11 @@ func Run(ctx context.Context, cs clients.ClientSets, inject InjectFunc) {
 		"Chaos Duration": chaosDetails.ChaosDuration,
 	})
 
-	go litmusCommon.AbortWatcher(chaosDetails.ExperimentName, cs, &resultDetails, &chaosDetails, &eventsDetails)
-
+	// Abort handling is watchAbort's, not litmusCommon.AbortWatcher's -- the latter's
+	// os.Exit(1) would kill the goroutine parked in the fault's hold and skip its revert.
+	experimentDone := make(chan struct{})
+	defer close(experimentDone)
+	go watchAbort(ctx, experimentDone, cs, &resultDetails, &chaosDetails, &eventsDetails)
 	if chaosDetails.DefaultHealthCheck {
 		log.Info("[Status]: Verify that the AUT (Application Under Test) is running (pre-chaos)")
 		if err := status.AUTStatusCheck(cs, &chaosDetails); err != nil {
@@ -265,9 +333,20 @@ func Run(ctx context.Context, cs clients.ClientSets, inject InjectFunc) {
 	}
 
 	chaosDetails.Phase = types.ChaosInjectPhase
-	if err := inject(ctx, cs, &chaosDetails); err != nil {
-		log.Errorf("Chaos injection failed, err: %v", err)
-		result.RecordAfterFailure(&chaosDetails, &resultDetails, err, cs, &eventsDetails)
+	injectErr := inject(ctx, cs, &chaosDetails)
+	if ctx.Err() != nil {
+		// Aborted. inject() has already reverted (its revert runs on RevertContext, which
+		// survives the cancellation), so the target is clean; record Stopped and stop.
+		if injectErr != nil {
+			log.Errorf("Chaos injection returned during abort, err: %v", injectErr)
+		}
+		log.Info("[Abort]: fault reverted -- recording Stopped verdict")
+		recordAbort(cs, &resultDetails, &chaosDetails, &eventsDetails)
+		return
+	}
+	if injectErr != nil {
+		log.Errorf("Chaos injection failed, err: %v", injectErr)
+		result.RecordAfterFailure(&chaosDetails, &resultDetails, injectErr, cs, &eventsDetails)
 		return
 	}
 
@@ -285,11 +364,17 @@ func Run(ctx context.Context, cs clients.ClientSets, inject InjectFunc) {
 
 	// Fallback for a fault whose InjectFunc never called HoldChaos (not built on the
 	// shared patch helpers, e.g. a teardown step, or one with no hold-then-revert
-	// shape): evaluate probes here, post-revert -- the pre-existing behavior, better
-	// than never running them at all.
-	if chaosDetails.EngineName != "" && len(resultDetails.ProbeDetails) != 0 && !midChaosRan {
-		if err := probe.RunProbes(ctx, &chaosDetails, cs, &resultDetails, "PostChaos", &eventsDetails); err != nil {
-			probeErr = err
+	// shape): evaluate here, post-revert -- weaker than the mid-chaos evaluation, but
+	// far better than never running the check at all, which would make such a fault
+	// report Passed unconditionally.
+	if chaosDetails.EngineName != "" && !midChaosRan {
+		if hasExplicitProbes {
+			if err := probe.RunProbes(ctx, &chaosDetails, cs, &resultDetails, "PostChaos", &eventsDetails); err != nil {
+				probeErr = err
+			}
+		} else if ok, why := defaultRecoveryAssertion(ctx, cs, &chaosDetails); !ok {
+			defaultCheckFail = why
+			log.Errorf("[Recovery]: default recovery assertion FAILED post-revert (%s)", why)
 		}
 	}
 

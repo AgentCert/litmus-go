@@ -18,8 +18,11 @@ func GetENV(experimentDetails *experimentTypes.ExperimentDetails) {
 	experimentDetails.ChaosUID = clientTypes.UID(types.Getenv("CHAOS_UID", ""))
 	experimentDetails.InstanceID = types.Getenv("INSTANCE_ID", "")
 	experimentDetails.ChaosPodName = types.Getenv("POD_NAME", "")
-	experimentDetails.MemoryConsumptionPercentage = types.Getenv("MEMORY_CONSUMPTION_PERCENTAGE", "")
-	experimentDetails.MemoryConsumptionMebibytes = types.Getenv("MEMORY_CONSUMPTION_MEBIBYTES", "")
+	// "0" is the sentinel chaoslib/litmus/node-memory-hog/lib compares against to
+	// mean "not provided". Defaulting to "" left the documented 30% default and the
+	// whole mebibytes branch unreachable, so the fault hogged `--vm-bytes 0%`.
+	experimentDetails.MemoryConsumptionPercentage = types.Getenv("MEMORY_CONSUMPTION_PERCENTAGE", "0")
+	experimentDetails.MemoryConsumptionMebibytes = types.Getenv("MEMORY_CONSUMPTION_MEBIBYTES", "0")
 	experimentDetails.NumberOfWorkers = types.Getenv("NUMBER_OF_WORKERS", "1")
 	experimentDetails.LIBImage = types.Getenv("LIB_IMAGE", "litmuschaos/go-runner:latest")
 	experimentDetails.LIBImagePullPolicy = types.Getenv("LIB_IMAGE_PULL_POLICY", "Always")

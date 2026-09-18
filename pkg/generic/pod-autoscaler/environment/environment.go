@@ -17,7 +17,12 @@ func GetENV(experimentDetails *experimentTypes.ExperimentDetails) {
 	experimentDetails.ChaosDuration, _ = strconv.Atoi(types.Getenv("TOTAL_CHAOS_DURATION", "60"))
 	experimentDetails.RampTime, _ = strconv.Atoi(types.Getenv("RAMP_TIME", "0"))
 	experimentDetails.AppAffectPercentage, _ = strconv.Atoi(types.Getenv("APP_AFFECT_PERC", "100"))
-	experimentDetails.Replicas, _ = strconv.Atoi(types.Getenv("REPLICA_COUNT", ""))
+	// Atoi("") returns 0 with the error discarded, and nothing downstream validated
+	// it — so an unset REPLICA_COUNT scaled the target to ZERO replicas (a full
+	// outage rather than the intended scale-up) and the readiness check was then
+	// satisfied by 0 == 0, reporting Pass. Default to the chart's own value; the
+	// positive-integer guard in PreparePodAutoscaler catches explicit bad input.
+	experimentDetails.Replicas, _ = strconv.Atoi(types.Getenv("REPLICA_COUNT", "5"))
 	experimentDetails.ChaosUID = clientTypes.UID(types.Getenv("CHAOS_UID", ""))
 	experimentDetails.InstanceID = types.Getenv("INSTANCE_ID", "")
 	experimentDetails.ChaosPodName = types.Getenv("POD_NAME", "")
@@ -32,8 +37,18 @@ func GetENV(experimentDetails *experimentTypes.ExperimentDetails) {
 func getAppDetails() (string, string, string) {
 	targets := types.Getenv("TARGETS", "")
 	app := types.GetTargets(targets)
-	if len(app) != 0 && (app[0].Kind == "deployment" || app[0].Kind == "statefulset") {
-		return app[0].Namespace, app[0].Kind, app[0].Labels[0]
+	if len(app) == 0 || (app[0].Kind != "deployment" && app[0].Kind != "statefulset") {
+		return "", "", ""
 	}
-	return "", "", ""
+	// types.GetTargets fills Labels only when the third TARGETS field contains "=",
+	// and Names otherwise. Targeting by resource name is a first-class form, and an
+	// empty list parses to nil, so app[0].Labels[0] panicked with an unrecovered
+	// index-out-of-range before any ChaosResult could record the failure. Return an
+	// empty label instead: the caller's target selection then fails cleanly with a
+	// real message rather than crashing the experiment pod.
+	var label string
+	if len(app[0].Labels) != 0 {
+		label = app[0].Labels[0]
+	}
+	return app[0].Namespace, app[0].Kind, label
 }

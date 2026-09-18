@@ -200,6 +200,10 @@ func prepareStressChaos(experimentsDetails *experimentTypes.ExperimentDetails, c
 	}
 
 	log.Info("[Wait]: Waiting for chaos completion")
+	// stressorOutput carries the stressor's own stdout/stderr out of the waiter
+	// goroutine so it can be attached to the returned error. Writing it before the
+	// send on `done` and reading it after the receive is ordered by the channel.
+	var stressorOutput string
 	// channel to check the completion of the stress process
 	go func() {
 		var errList []string
@@ -207,7 +211,11 @@ func prepareStressChaos(experimentsDetails *experimentTypes.ExperimentDetails, c
 		for _, t := range targets {
 			for i := range t.Cmds {
 				if err := t.Cmds[i].Cmd.Wait(); err != nil {
-					log.Infof("stress process failed, err: %v, out: %v", err, t.Cmds[i].Buffer.String())
+					out := strings.TrimSpace(t.Cmds[i].Buffer.String())
+					log.Infof("stress process failed, err: %v, out: %v", err, out)
+					if out != "" {
+						stressorOutput = out
+					}
 					if _, ok := err.(*exec.ExitError); ok {
 						exitErr = err
 						continue
@@ -265,7 +273,14 @@ func prepareStressChaos(experimentsDetails *experimentTypes.ExperimentDetails, c
 					return cerrors.Error{ErrorCode: cerrors.ErrorTypeExperimentAborted, Source: chaosDetails.ChaosPodName, Reason: fmt.Sprintf("process stopped with SIGTERM signal")}
 				}
 			}
-			return cerrors.Error{ErrorCode: cerrors.ErrorTypeChaosInject, Source: chaosDetails.ChaosPodName, Reason: err.Error()}
+			// Attach the stressor's own output. Without it the operator sees only
+			// "exit status 1" and cannot tell a missing binary from a read-only
+			// filesystem from a malformed argument.
+			reason := err.Error()
+			if stressorOutput != "" {
+				reason = fmt.Sprintf("%s: %s", reason, stressorOutput)
+			}
+			return cerrors.Error{ErrorCode: cerrors.ErrorTypeChaosInject, Source: chaosDetails.ChaosPodName, Reason: reason}
 		}
 		log.Info("[Info]: Reverting Chaos")
 		if err := revertChaosForAllTargets(targets, resultDetails, chaosDetails.ChaosNamespace, len(targets)-1); err != nil {
@@ -344,6 +359,26 @@ func terminateProcess(t *targetDetails) error {
 	return nil
 }
 
+// unsetToZero folds the two spellings of "not provided" into one. types.Getenv
+// returns "" for an absent variable, while the tunable logic in prepareStressor
+// compares against "0"; without this normalisation the intended default branch is
+// unreachable and the empty string flows straight into a stress-ng argument.
+func unsetToZero(v string) string {
+	if strings.TrimSpace(v) == "" {
+		return "0"
+	}
+	return strings.TrimSpace(v)
+}
+
+// orDefault substitutes fallback for an unset tunable, so a missing env var yields
+// a working stressor invocation instead of a malformed one such as `--vm-bytes M`.
+func orDefault(v, fallback string) string {
+	if strings.TrimSpace(v) == "" {
+		return fallback
+	}
+	return strings.TrimSpace(v)
+}
+
 // prepareStressor will set the required stressors for the given experiment
 func prepareStressor(experimentDetails *experimentTypes.ExperimentDetails) []string {
 
@@ -355,55 +390,70 @@ func prepareStressor(experimentDetails *experimentTypes.ExperimentDetails) []str
 
 	switch experimentDetails.StressType {
 	case "pod-cpu-stress":
+		// Defaults mirror chaos-charts/faults/kubernetes/pod-cpu-hog/fault.yaml.
+		cpuCores := orDefault(experimentDetails.CPUcores, "1")
+		cpuLoad := orDefault(experimentDetails.CPULoad, "100")
 
 		log.InfoWithValues("[Info]: Details of Stressor:", logrus.Fields{
-			"CPU Core": experimentDetails.CPUcores,
-			"CPU Load": experimentDetails.CPULoad,
+			"CPU Core": cpuCores,
+			"CPU Load": cpuLoad,
 			"Timeout":  experimentDetails.ChaosDuration,
 		})
-		stressArgs = append(stressArgs, "--cpu "+experimentDetails.CPUcores)
-		stressArgs = append(stressArgs, " --cpu-load "+experimentDetails.CPULoad)
+		stressArgs = append(stressArgs, "--cpu "+cpuCores)
+		stressArgs = append(stressArgs, "--cpu-load "+cpuLoad)
 
 	case "pod-memory-stress":
+		// Defaults mirror chaos-charts/faults/kubernetes/pod-memory-hog/fault.yaml.
+		workers := orDefault(experimentDetails.NumberOfWorkers, "4")
+		memory := orDefault(experimentDetails.MemoryConsumption, "500")
 
 		log.InfoWithValues("[Info]: Details of Stressor:", logrus.Fields{
-			"Number of Workers":  experimentDetails.NumberOfWorkers,
-			"Memory Consumption": experimentDetails.MemoryConsumption,
+			"Number of Workers":  workers,
+			"Memory Consumption": memory,
 			"Timeout":            experimentDetails.ChaosDuration,
 		})
-		stressArgs = append(stressArgs, "--vm "+experimentDetails.NumberOfWorkers+" --vm-bytes "+experimentDetails.MemoryConsumption+"M")
+		stressArgs = append(stressArgs, "--vm "+workers+" --vm-bytes "+memory+"M")
 
 	case "pod-io-stress":
+		// Treat "" and "0" alike as "not provided". The charts document the empty
+		// string as the way to deselect one of these two tunables, while this logic
+		// only ever tested "0" — so following the documented instructions produced
+		// `--hdd-bytes %` and an immediate stress-ng failure.
+		fsPercentage := unsetToZero(experimentDetails.FilesystemUtilizationPercentage)
+		fsBytes := unsetToZero(experimentDetails.FilesystemUtilizationBytes)
+
 		var hddbytes string
-		if experimentDetails.FilesystemUtilizationBytes == "0" {
-			if experimentDetails.FilesystemUtilizationPercentage == "0" {
-				hddbytes = "10%"
-				log.Info("Neither of FilesystemUtilizationPercentage or FilesystemUtilizationBytes provided, proceeding with a default FilesystemUtilizationPercentage value of 10%")
-			} else {
-				hddbytes = experimentDetails.FilesystemUtilizationPercentage + "%"
-			}
-		} else {
-			if experimentDetails.FilesystemUtilizationPercentage == "0" {
-				hddbytes = experimentDetails.FilesystemUtilizationBytes + "G"
-			} else {
-				hddbytes = experimentDetails.FilesystemUtilizationPercentage + "%"
-				log.Warn("Both FsUtilPercentage & FsUtilBytes provided as inputs, using the FsUtilPercentage value to proceed with stress exp")
-			}
+		switch {
+		case fsBytes == "0" && fsPercentage == "0":
+			hddbytes = "10%"
+			log.Info("Neither of FilesystemUtilizationPercentage or FilesystemUtilizationBytes provided, proceeding with a default FilesystemUtilizationPercentage value of 10%")
+		case fsBytes == "0":
+			hddbytes = fsPercentage + "%"
+		case fsPercentage == "0":
+			hddbytes = fsBytes + "G"
+		default:
+			hddbytes = fsPercentage + "%"
+			log.Warn("Both FsUtilPercentage & FsUtilBytes provided as inputs, using the FsUtilPercentage value to proceed with stress exp")
 		}
+		// Defaults mirror chaos-charts/faults/kubernetes/pod-io-stress/fault.yaml.
+		ioWorkers := orDefault(experimentDetails.NumberOfWorkers, "4")
+
 		log.InfoWithValues("[Info]: Details of Stressor:", logrus.Fields{
-			"io":                experimentDetails.NumberOfWorkers,
-			"hdd":               experimentDetails.NumberOfWorkers,
+			"io":                ioWorkers,
+			"hdd":               ioWorkers,
 			"hdd-bytes":         hddbytes,
 			"Timeout":           experimentDetails.ChaosDuration,
 			"Volume Mount Path": experimentDetails.VolumeMountPath,
 		})
-		if experimentDetails.VolumeMountPath == "" {
-			stressArgs = append(stressArgs, "--io "+experimentDetails.NumberOfWorkers+" --hdd "+experimentDetails.NumberOfWorkers+" --hdd-bytes "+hddbytes)
+		if strings.TrimSpace(experimentDetails.VolumeMountPath) == "" {
+			stressArgs = append(stressArgs, "--io "+ioWorkers+" --hdd "+ioWorkers+" --hdd-bytes "+hddbytes)
 		} else {
-			stressArgs = append(stressArgs, "--io "+experimentDetails.NumberOfWorkers+" --hdd "+experimentDetails.NumberOfWorkers+" --hdd-bytes "+hddbytes+" --temp-path "+experimentDetails.VolumeMountPath)
+			stressArgs = append(stressArgs, "--io "+ioWorkers+" --hdd "+ioWorkers+" --hdd-bytes "+hddbytes+" --temp-path "+strings.TrimSpace(experimentDetails.VolumeMountPath))
 		}
-		if experimentDetails.CPUcores != "0" {
-			stressArgs = append(stressArgs, "--cpu %v", experimentDetails.CPUcores)
+		// append() does no formatting: passing a format string here pushed TWO
+		// elements ("--cpu %v" and the value), producing `stress-ng --cpu %v 2`.
+		if experimentDetails.CPUcores != "" && experimentDetails.CPUcores != "0" {
+			stressArgs = append(stressArgs, "--cpu "+experimentDetails.CPUcores)
 		}
 
 	default:
@@ -675,7 +725,7 @@ func injectChaos(t *targetDetails, stressors string, index int, stressType strin
 	}
 	return &Command{
 		Cmd:    cmd,
-		Buffer: buf,
+		Buffer: &buf,
 	}, nil
 }
 
@@ -692,6 +742,10 @@ type targetDetails struct {
 }
 
 type Command struct {
-	Cmd    *exec.Cmd
-	Buffer bytes.Buffer
+	Cmd *exec.Cmd
+	// Buffer must be a pointer: cmd.Stdout/cmd.Stderr are set to the address of a
+	// bytes.Buffer, so storing a copy of that struct would freeze an empty snapshot
+	// taken before the process ever wrote to it — silently discarding the stressor's
+	// own error output and reducing every failure to a bare "exit status 1".
+	Buffer *bytes.Buffer
 }

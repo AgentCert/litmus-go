@@ -17,6 +17,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/litmuschaos/litmus-go/pkg/clients"
@@ -36,7 +37,13 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 	if err != nil {
 		return err
 	}
-	targetContainer := os.Getenv("TARGET_CONTAINER")
+	targetContainer := strings.TrimSpace(os.Getenv("TARGET_CONTAINER"))
+	if targetContainer == "" {
+		// An empty targetContainerName passes API validation but gives the ephemeral
+		// container its own PID namespace, so `kill -STOP 1` freezes its own shell and the
+		// application is never touched -- a silent no-op that still reports success.
+		return fmt.Errorf("TARGET_CONTAINER is required for this fault: an empty value would freeze the ephemeral container's own shell instead of the target")
+	}
 	debugImage := os.Getenv("DEBUG_IMAGE")
 	ts := time.Now().Unix()
 
@@ -50,7 +57,8 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 		}
 		debugName := fmt.Sprintf("chaos-freeze-%d-%s", ts, pod.GetName())
 		if len(debugName) > 63 {
-			debugName = debugName[:63]
+			// A container name is a DNS-1123 label, so it must not end in '-'.
+			debugName = strings.TrimRight(debugName[:63], "-")
 		}
 		log.Infof("Injecting: freezing pod=%s container=%s via ephemeral debug container=%s (image=%s)", pod.GetName(), targetContainer, debugName, debugImage)
 
@@ -82,7 +90,7 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 	}
 
 	log.Infof("Holding fault for %ds (each ephemeral debug container independently runs its own STOP -> sleep -> CONT sequence, so the freeze self-reverts even if this job is interrupted)", chaosDetails.ChaosDuration)
-	itbench.Sleep(ctx, chaosDetails.ChaosDuration)
+	itbench.HoldChaos(ctx, chaosDetails)
 
 	log.Info("Fault duration elapsed. NOTE: ephemeral debug containers cannot be individually removed (Kubernetes API limitation) -- they remain visible (Completed) under 'kubectl describe pod' until the Pod itself is deleted/recreated. This is an expected, documented side effect of this fault's mechanism, not a bug.")
 	for _, a := range attached {

@@ -58,11 +58,11 @@ func TestHoldChaos_RunsHookAfterTheHold(t *testing.T) {
 	}
 }
 
-// TestHoldChaos_ContextCancelDuringHoldStillRunsHook confirms the abort-watcher path (ctx
-// cancellation via SIGTERM) still gives the hook a chance to run -- Sleep returns early on
-// ctx.Done(), and HoldChaos must still call the hook afterward so a killed run doesn't
-// silently skip probe evaluation.
-func TestHoldChaos_ContextCancelDuringHoldStillRunsHook(t *testing.T) {
+// TestHoldChaos_ContextCancelSkipsHookAndReturns covers the abort path (SIGTERM relayed by
+// the dispatcher's signal-aware ctx): HoldChaos must return promptly so the caller's revert
+// still runs, and must NOT evaluate recovery -- the agent never got its full remediation
+// window, and Run() records a Stopped verdict for the run regardless.
+func TestHoldChaos_ContextCancelSkipsHookAndReturns(t *testing.T) {
 	hookRan := false
 	setMidChaosHook(func(ctx context.Context) { hookRan = true })
 	defer setMidChaosHook(nil)
@@ -77,10 +77,43 @@ func TestHoldChaos_ContextCancelDuringHoldStillRunsHook(t *testing.T) {
 	HoldChaos(ctx, &types.ChaosDetails{ChaosDuration: 300}) // would block 300s without the cancel
 	elapsed := time.Since(start)
 
-	if !hookRan {
-		t.Fatal("HoldChaos did not run the mid-chaos hook after ctx cancellation")
-	}
 	if elapsed >= 300*time.Second {
 		t.Fatalf("HoldChaos did not honor ctx cancellation, took %v", elapsed)
+	}
+	if hookRan {
+		t.Fatal("HoldChaos evaluated recovery after an abort; the hold was cut short so the check is meaningless")
+	}
+}
+
+// TestRevertContext_SurvivesParentCancellation is what keeps an aborted run from leaving the
+// target permanently mutated: every helper's post-hold revert runs on this context, so it
+// must stay usable after the experiment's own ctx has been cancelled by SIGTERM.
+func TestRevertContext_SurvivesParentCancellation(t *testing.T) {
+	parent, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	revertCtx, revertCancel := RevertContext()
+	defer revertCancel()
+
+	if parent.Err() == nil {
+		t.Fatal("test setup: parent context should already be cancelled")
+	}
+	if err := revertCtx.Err(); err != nil {
+		t.Fatalf("RevertContext is already done (%v); the revert API calls would fail", err)
+	}
+	deadline, ok := revertCtx.Deadline()
+	if !ok {
+		t.Fatal("RevertContext has no deadline; a hung revert would block the abort grace period forever")
+	}
+	if remaining := time.Until(deadline); remaining <= 0 || remaining > RevertTimeout+time.Second {
+		t.Fatalf("RevertContext deadline is %v away, want (0, %v]", remaining, RevertTimeout)
+	}
+}
+
+// TestAbortRevertGraceExceedsRevertTimeout guards the ordering the abort path depends on:
+// the watcher must not force-exit while a revert that is merely slow is still in flight.
+func TestAbortRevertGraceExceedsRevertTimeout(t *testing.T) {
+	if abortRevertGrace <= RevertTimeout {
+		t.Fatalf("abortRevertGrace=%v must exceed RevertTimeout=%v, else a slow revert is killed mid-flight", abortRevertGrace, RevertTimeout)
 	}
 }

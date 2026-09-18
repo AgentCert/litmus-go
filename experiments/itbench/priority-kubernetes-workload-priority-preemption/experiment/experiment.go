@@ -18,6 +18,7 @@ import (
 	itbench "github.com/litmuschaos/litmus-go/pkg/itbench/common"
 	"github.com/litmuschaos/litmus-go/pkg/types"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
@@ -42,17 +43,26 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 		return err
 	}
 	allocMemRaw, _, _ := unstructured.NestedString(node.Object, "status", "allocatable", "memory")
-	allocMemKi, err := parseKiValue(allocMemRaw)
+	allocMem, err := resource.ParseQuantity(allocMemRaw)
 	if err != nil {
 		return fmt.Errorf("parsing node allocatable memory %q: %w", allocMemRaw, err)
 	}
-	decoyMemPercent, _ := strconv.Atoi(os.Getenv("DECOY_MEMORY_PERCENT"))
-	decoyMemKi := allocMemKi * int64(decoyMemPercent) / 100
+	// Discarding this parse error would make the decoy request 0Ki, so it schedules
+	// alongside everything and preempts nothing -- while still reporting success.
+	decoyMemPercent, err := strconv.Atoi(strings.TrimSpace(os.Getenv("DECOY_MEMORY_PERCENT")))
+	if err != nil || decoyMemPercent <= 0 || decoyMemPercent > 100 {
+		return fmt.Errorf("DECOY_MEMORY_PERCENT must be an integer in 1-100, got %q", os.Getenv("DECOY_MEMORY_PERCENT"))
+	}
+	decoyMemKi := allocMem.Value() / 1024 * int64(decoyMemPercent) / 100
 	decoyMemoryRequest := fmt.Sprintf("%dKi", decoyMemKi)
 	log.Infof("Node allocatable memory=%s; decoy will request %s (%d%%), pinned to node=%s", allocMemRaw, decoyMemoryRequest, decoyMemPercent, nodeName)
 
 	priorityClassName := os.Getenv("PRIORITY_CLASS_NAME")
-	priorityValue, _ := strconv.Atoi(os.Getenv("PRIORITY_VALUE"))
+	// A PriorityClass with value 0 equals the default pod priority, so nothing is preempted.
+	priorityValue, err := strconv.Atoi(strings.TrimSpace(os.Getenv("PRIORITY_VALUE")))
+	if err != nil || priorityValue <= 0 {
+		return fmt.Errorf("PRIORITY_VALUE must be a positive integer, got %q", os.Getenv("PRIORITY_VALUE"))
+	}
 	decoyName := os.Getenv("DECOY_NAME")
 	decoyNamespace := os.Getenv("DECOY_NAMESPACE")
 	if decoyNamespace == "" {
@@ -103,25 +113,36 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 	if _, err := pcClient.Create(ctx, priorityClass, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("creating priorityclass: %w", err)
 	}
+	// Deferred from here on: the PriorityClass is cluster-scoped, so one left behind by a
+	// failed decoy create or an abort survives the namespace teardown and makes every later
+	// run fail with AlreadyExists.
+	defer func() {
+		revertCtx, cancel := itbench.RevertContext()
+		defer cancel()
+		log.Infof("Reverting: deleting PriorityClass %s", priorityClassName)
+		if err := pcClient.Delete(revertCtx, priorityClassName, metav1.DeleteOptions{}); err != nil && !k8serrors.IsNotFound(err) {
+			log.Errorf("failed to delete priorityclass (non-fatal): %v", err)
+		}
+	}()
 
 	log.Infof("Injecting: creating decoy pressure Deployment %s in %s", decoyName, decoyNamespace)
 	decoyClient := cs.DynamicClient.Resource(itbench.GVRDeployments).Namespace(decoyNamespace)
 	if _, err := decoyClient.Create(ctx, decoy, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("creating decoy deployment: %w", err)
 	}
+	defer func() {
+		revertCtx, cancel := itbench.RevertContext()
+		defer cancel()
+		log.Infof("Reverting: deleting decoy Deployment %s", decoyName)
+		if err := decoyClient.Delete(revertCtx, decoyName, metav1.DeleteOptions{}); err != nil && !k8serrors.IsNotFound(err) {
+			log.Errorf("failed to delete decoy deployment (non-fatal): %v", err)
+		}
+		if err := deleteDecoyPods(revertCtx, cs, decoyNamespace, decoyName); err != nil {
+			log.Errorf("failed to force-delete decoy pods (non-fatal): %v", err)
+		}
+	}()
 
-	itbench.Sleep(ctx, chaosDetails.ChaosDuration)
-
-	log.Infof("Reverting: deleting decoy Deployment %s and PriorityClass %s", decoyName, priorityClassName)
-	if err := decoyClient.Delete(ctx, decoyName, metav1.DeleteOptions{}); err != nil && !k8serrors.IsNotFound(err) {
-		log.Errorf("failed to delete decoy deployment (non-fatal): %v", err)
-	}
-	if err := deleteDecoyPods(ctx, cs, decoyNamespace, decoyName); err != nil {
-		log.Errorf("failed to force-delete decoy pods (non-fatal): %v", err)
-	}
-	if err := pcClient.Delete(ctx, priorityClassName, metav1.DeleteOptions{}); err != nil && !k8serrors.IsNotFound(err) {
-		log.Errorf("failed to delete priorityclass (non-fatal): %v", err)
-	}
+	itbench.HoldChaos(ctx, chaosDetails)
 	return nil
 }
 
@@ -138,10 +159,4 @@ func deleteDecoyPods(ctx context.Context, cs clients.ClientSets, namespace, deco
 		}
 	}
 	return nil
-}
-
-// parseKiValue parses a Kubernetes quantity string of the form "<N>Ki" into N.
-func parseKiValue(s string) (int64, error) {
-	s = strings.TrimSuffix(s, "Ki")
-	return strconv.ParseInt(s, 10, 64)
 }

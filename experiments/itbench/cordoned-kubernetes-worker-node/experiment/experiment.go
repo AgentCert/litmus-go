@@ -43,14 +43,16 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 		return fmt.Errorf("cordoning node: %w", err)
 	}
 
-	itbench.Sleep(ctx, chaosDetails.ChaosDuration)
+	itbench.HoldChaos(ctx, chaosDetails)
 
 	if origUnschedulable {
 		log.Infof("Node %s was already cordoned before injection; leaving it cordoned", nodeName)
 		return nil
 	}
+	revertCtx, cancel := itbench.RevertContext()
+	defer cancel()
 	log.Infof("Reverting: uncordoning node %s", nodeName)
-	if err := setUnschedulable(ctx, cs, nodeName, false); err != nil {
+	if err := setUnschedulable(revertCtx, cs, nodeName, false); err != nil {
 		return fmt.Errorf("uncordoning node: %w", err)
 	}
 	return nil

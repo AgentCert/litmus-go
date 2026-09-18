@@ -12,6 +12,7 @@ import (
 	"github.com/litmuschaos/litmus-go/pkg/log"
 	itbench "github.com/litmuschaos/litmus-go/pkg/itbench/common"
 	"github.com/litmuschaos/litmus-go/pkg/types"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
@@ -20,7 +21,7 @@ func Run(ctx context.Context, cs clients.ClientSets) {
 	itbench.Run(ctx, cs, inject)
 }
 
-func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.ChaosDetails) error {
+func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.ChaosDetails) (retErr error) {
 	if len(chaosDetails.AppDetail) == 0 || len(chaosDetails.AppDetail[0].Labels) == 0 {
 		return fmt.Errorf("no target label resolved: TARGETS env var was empty/unset or had no label selector")
 	}
@@ -54,16 +55,31 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 	}}
 
 	netpolClient := cs.DynamicClient.Resource(itbench.GVRNetworkPolicies).Namespace(namespace)
+
+	// The name is deterministic, so a policy left behind by an earlier aborted run would
+	// make every later run fail with AlreadyExists while the target stays blocked.
+	if err := netpolClient.Delete(ctx, netpolName, metav1.DeleteOptions{}); err == nil {
+		log.Infof("Cleared stale NetworkPolicy %s left by a previous run", netpolName)
+	} else if !k8serrors.IsNotFound(err) {
+		return fmt.Errorf("clearing stale networkpolicy %s: %w", netpolName, err)
+	}
+
 	log.Infof("Injecting: creating deny-all-ingress NetworkPolicy %s selecting %s=%s in %s", netpolName, kv[0], kv[1], namespace)
 	if _, err := netpolClient.Create(ctx, netpol, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("creating networkpolicy: %w", err)
 	}
+	defer func() {
+		revertCtx, cancel := itbench.RevertContext()
+		defer cancel()
+		log.Infof("Reverting: deleting NetworkPolicy %s", netpolName)
+		if err := netpolClient.Delete(revertCtx, netpolName, metav1.DeleteOptions{}); err != nil && !k8serrors.IsNotFound(err) {
+			log.Errorf("failed to delete NetworkPolicy %s -- the target stays blocked: %v", netpolName, err)
+			if retErr == nil {
+				retErr = fmt.Errorf("deleting networkpolicy: %w", err)
+			}
+		}
+	}()
 
-	itbench.Sleep(ctx, chaosDetails.ChaosDuration)
-
-	log.Infof("Reverting: deleting NetworkPolicy %s", netpolName)
-	if err := netpolClient.Delete(ctx, netpolName, metav1.DeleteOptions{}); err != nil {
-		return fmt.Errorf("deleting networkpolicy: %w", err)
-	}
+	itbench.HoldChaos(ctx, chaosDetails)
 	return nil
 }

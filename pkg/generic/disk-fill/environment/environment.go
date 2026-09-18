@@ -30,7 +30,9 @@ func GetENV(experimentDetails *experimentTypes.ExperimentDetails) {
 	experimentDetails.TargetPods = types.Getenv("TARGET_PODS", "")
 	experimentDetails.PodsAffectedPerc = types.Getenv("PODS_AFFECTED_PERC", "0")
 	experimentDetails.Sequence = types.Getenv("SEQUENCE", "parallel")
-	experimentDetails.EphemeralStorageMebibytes = types.Getenv("EPHEMERAL_STORAGE_MEBIBYTES", "")
+	// "0" matches the sentinel the helper's guard tests for, so an unset value now
+	// reaches that guard instead of falling through to a negative fill size.
+	experimentDetails.EphemeralStorageMebibytes = types.Getenv("EPHEMERAL_STORAGE_MEBIBYTES", "0")
 	experimentDetails.TerminationGracePeriodSeconds, _ = strconv.Atoi(types.Getenv("TERMINATION_GRACE_PERIOD_SECONDS", ""))
 	experimentDetails.DataBlockSize, _ = strconv.Atoi(types.Getenv("DATA_BLOCK_SIZE", "256"))
 	experimentDetails.NodeLabel = types.Getenv("NODE_LABEL", "")

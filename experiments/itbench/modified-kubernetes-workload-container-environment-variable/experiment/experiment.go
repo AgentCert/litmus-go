@@ -53,7 +53,7 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 	envList, _, _ := unstructured.NestedSlice(container, "env")
 
 	envIdx := -1
-	var origValue string
+	var origEntry map[string]interface{}
 	for i, e := range envList {
 		m, ok := e.(map[string]interface{})
 		if !ok {
@@ -61,24 +61,28 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 		}
 		if n, _ := m["name"].(string); n == envVarName {
 			envIdx = i
-			origValue, _ = m["value"].(string)
+			origEntry = m
 			break
 		}
 	}
 
 	basePath := fmt.Sprintf("/spec/template/spec/containers/%d/env", idx)
 	existed := envIdx >= 0
+	badEntry := map[string]string{"name": envVarName, "value": badValue}
 
 	var injectPatch []byte
 	if existed {
-		log.Infof("Injecting: setting %s=%s on %s (was %q)", envVarName, badValue, containerName, origValue)
-		injectPatch, err = json.Marshal([]jsonPatchOp{{Op: "replace", Path: fmt.Sprintf("%s/%d/value", basePath, envIdx), Value: badValue}})
+		// The whole entry is replaced rather than just its /value: a var sourced from a
+		// ConfigMap/Secret has no "value" member, and RFC 6902 "replace" on a missing key
+		// is rejected by the API server.
+		log.Infof("Injecting: setting %s=%s on %s (was %v)", envVarName, badValue, containerName, origEntry)
+		injectPatch, err = json.Marshal([]jsonPatchOp{{Op: "replace", Path: fmt.Sprintf("%s/%d", basePath, envIdx), Value: badEntry}})
 	} else {
 		log.Infof("Injecting: adding %s=%s on %s (did not exist)", envVarName, badValue, containerName)
 		if len(envList) == 0 {
-			injectPatch, err = json.Marshal([]jsonPatchOp{{Op: "add", Path: basePath, Value: []map[string]string{{"name": envVarName, "value": badValue}}}})
+			injectPatch, err = json.Marshal([]jsonPatchOp{{Op: "add", Path: basePath, Value: []map[string]string{badEntry}}})
 		} else {
-			injectPatch, err = json.Marshal([]jsonPatchOp{{Op: "add", Path: basePath + "/-", Value: map[string]string{"name": envVarName, "value": badValue}}})
+			injectPatch, err = json.Marshal([]jsonPatchOp{{Op: "add", Path: basePath + "/-", Value: badEntry}})
 		}
 		envIdx = len(envList) // the index it will land at once appended
 	}
@@ -89,12 +93,15 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 		return fmt.Errorf("patching env var: %w", err)
 	}
 
-	itbench.Sleep(ctx, chaosDetails.ChaosDuration)
+	itbench.HoldChaos(ctx, chaosDetails)
+
+	revertCtx, cancel := itbench.RevertContext()
+	defer cancel()
 
 	var revertPatch []byte
 	if existed {
-		log.Infof("Reverting: restoring %s=%q on %s", envVarName, origValue, containerName)
-		revertPatch, err = json.Marshal([]jsonPatchOp{{Op: "replace", Path: fmt.Sprintf("%s/%d/value", basePath, envIdx), Value: origValue}})
+		log.Infof("Reverting: restoring %s on %s", envVarName, containerName)
+		revertPatch, err = json.Marshal([]jsonPatchOp{{Op: "replace", Path: fmt.Sprintf("%s/%d", basePath, envIdx), Value: origEntry}})
 	} else {
 		log.Infof("Reverting: removing %s from %s (it did not exist originally)", envVarName, containerName)
 		revertPatch, err = json.Marshal([]jsonPatchOp{{Op: "remove", Path: fmt.Sprintf("%s/%d", basePath, envIdx)}})
@@ -102,7 +109,7 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 	if err != nil {
 		return err
 	}
-	if err := itbench.JSONPatch(ctx, cs, gvr, namespace, name, revertPatch); err != nil {
+	if err := itbench.JSONPatch(revertCtx, cs, gvr, namespace, name, revertPatch); err != nil {
 		return fmt.Errorf("reverting env var: %w", err)
 	}
 	return nil

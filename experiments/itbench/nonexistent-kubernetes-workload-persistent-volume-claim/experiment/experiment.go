@@ -13,6 +13,7 @@ import (
 	"github.com/litmuschaos/litmus-go/pkg/log"
 	itbench "github.com/litmuschaos/litmus-go/pkg/itbench/common"
 	"github.com/litmuschaos/litmus-go/pkg/types"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
@@ -21,7 +22,7 @@ func Run(ctx context.Context, cs clients.ClientSets) {
 	itbench.Run(ctx, cs, inject)
 }
 
-func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.ChaosDetails) error {
+func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.ChaosDetails) (retErr error) {
 	target, idx, _, err := itbench.ResolveTargetWorkloadAndContainer(ctx, cs, chaosDetails)
 	if err != nil {
 		return err
@@ -46,9 +47,22 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 	if _, err := pvcClient.Create(ctx, pvc, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("creating pvc: %w", err)
 	}
+	// Deferred: the PVC name is derived from the workload name, so one left behind by a
+	// failed patch or an abort makes every later run fail with AlreadyExists.
+	defer func() {
+		revertCtx, cancel := itbench.RevertContext()
+		defer cancel()
+		log.Infof("Reverting: deleting fault PVC %s", pvcName)
+		if err := pvcClient.Delete(revertCtx, pvcName, metav1.DeleteOptions{}); err != nil && !k8serrors.IsNotFound(err) {
+			log.Errorf("failed to delete fault PVC %s: %v", pvcName, err)
+			if retErr == nil {
+				retErr = fmt.Errorf("deleting pvc: %w", err)
+			}
+		}
+	}()
 
 	log.Infof("Patching %s to mount fault PVC at %s", target.GetName(), mountPath)
-	err = itbench.AppendAndRemoveWorkloadArrayItems(ctx, cs, chaosDetails, []itbench.ArrayAppendSpec{
+	return itbench.AppendAndRemoveWorkloadArrayItems(ctx, cs, chaosDetails, []itbench.ArrayAppendSpec{
 		{
 			Path: []string{"spec", "template", "spec", "containers", fmt.Sprintf("%d", idx), "volumeMounts"},
 			Item: map[string]interface{}{"name": "fault-volume", "mountPath": mountPath},
@@ -58,13 +72,4 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 			Item: map[string]interface{}{"name": "fault-volume", "persistentVolumeClaim": map[string]interface{}{"claimName": pvcName}},
 		},
 	})
-	if err != nil {
-		return err
-	}
-
-	log.Infof("Reverting: deleting fault PVC %s", pvcName)
-	if err := pvcClient.Delete(ctx, pvcName, metav1.DeleteOptions{}); err != nil {
-		return fmt.Errorf("deleting pvc: %w", err)
-	}
-	return nil
 }

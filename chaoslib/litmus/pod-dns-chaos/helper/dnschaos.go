@@ -123,7 +123,7 @@ func preparePodDNSChaos(experimentsDetails *experimentTypes.ExperimentDetails, c
 	done := make(chan error, 1)
 
 	for index, t := range targets {
-		targets[index].Cmd, err = injectChaos(experimentsDetails, t)
+		targets[index].Cmd, targets[index].Buf, err = injectChaos(experimentsDetails, t)
 		if err != nil {
 			return stacktrace.Propagate(err, "could not inject chaos")
 		}
@@ -149,12 +149,23 @@ func preparePodDNSChaos(experimentsDetails *experimentTypes.ExperimentDetails, c
 		var errList []string
 		for _, t := range targets {
 			if err := t.Cmd.Wait(); err != nil {
-				errList = append(errList, err.Error())
+				// Attach dns_interceptor's own output; Wait() alone yields only
+				// "exit status 1", which tells the operator nothing actionable.
+				msg := err.Error()
+				if t.Buf != nil {
+					if out := strings.TrimSpace(t.Buf.String()); out != "" {
+						msg = fmt.Sprintf("%s: %s", msg, out)
+					}
+				}
+				errList = append(errList, msg)
 			}
 		}
 		if len(errList) != 0 {
 			log.Errorf("err: %v", strings.Join(errList, ", "))
 			done <- fmt.Errorf("err: %v", strings.Join(errList, ", "))
+			// Without this return both sends executed, leaking this goroutine forever
+			// on the error path (done is buffered with capacity 1).
+			return
 		}
 		done <- nil
 	}()
@@ -208,20 +219,22 @@ func preparePodDNSChaos(experimentsDetails *experimentTypes.ExperimentDetails, c
 	return nil
 }
 
-func injectChaos(experimentsDetails *experimentTypes.ExperimentDetails, t targetDetails) (*exec.Cmd, error) {
+func injectChaos(experimentsDetails *experimentTypes.ExperimentDetails, t targetDetails) (*exec.Cmd, *bytes.Buffer, error) {
 
 	// prepare dns interceptor
-	var out bytes.Buffer
+	out := new(bytes.Buffer)
 	commandTemplate := fmt.Sprintf("sudo TARGET_PID=%d CHAOS_TYPE=%s SPOOF_MAP='%s' TARGET_HOSTNAMES='%s' CHAOS_DURATION=%d MATCH_SCHEME=%s nsutil -p -n -t %d -- dns_interceptor", t.Pid, experimentsDetails.ChaosType, experimentsDetails.SpoofMap, experimentsDetails.TargetHostNames, experimentsDetails.ChaosDuration, experimentsDetails.MatchScheme, t.Pid)
 	cmd := exec.Command("/bin/bash", "-c", commandTemplate)
 	log.Info(cmd.String())
-	cmd.Stdout = &out
-	cmd.Stderr = &out
+	cmd.Stdout = out
+	cmd.Stderr = out
 
 	if err = cmd.Start(); err != nil {
-		return nil, cerrors.Error{ErrorCode: cerrors.ErrorTypeChaosInject, Source: experimentsDetails.ChaosPodName, Target: fmt.Sprintf("{podName: %s, namespace: %s}", t.Name, t.Namespace), Reason: fmt.Sprintf("faild to inject chaos: %s", out.String())}
+		return nil, out, cerrors.Error{ErrorCode: cerrors.ErrorTypeChaosInject, Source: experimentsDetails.ChaosPodName, Target: fmt.Sprintf("{podName: %s, namespace: %s}", t.Name, t.Namespace), Reason: fmt.Sprintf("failed to inject chaos: %s", out.String())}
 	}
-	return cmd, nil
+	// The buffer is returned rather than dropped here: cmd.Start() returns before the
+	// child has written anything, so out.String() is always empty at this point.
+	return cmd, out, nil
 }
 
 func terminateProcess(t targetDetails) error {
@@ -294,5 +307,10 @@ type targetDetails struct {
 	Pid             int
 	CommandPid      int
 	Cmd             *exec.Cmd
-	Source          string
+	// Buf holds the dns_interceptor process's own stdout/stderr. It must outlive
+	// injectChaos: the real failure surfaces later at Cmd.Wait(), whose error is only
+	// "exit status 1", so without carrying the buffer out of that function the actual
+	// reason (a SPOOF_MAP parse error, a missing binary) was silently discarded.
+	Buf    *bytes.Buffer
+	Source string
 }

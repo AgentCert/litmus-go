@@ -45,8 +45,11 @@ func GetENV(experimentDetails *experimentTypes.ExperimentDetails, expName string
 		experimentDetails.StressType = "pod-memory-stress"
 
 	case "pod-io-stress":
-		experimentDetails.FilesystemUtilizationPercentage = types.Getenv("FILESYSTEM_UTILIZATION_PERCENTAGE", "")
-		experimentDetails.FilesystemUtilizationBytes = types.Getenv("FILESYSTEM_UTILIZATION_BYTES", "")
+		// "0" matches the sentinel prepareStressor tests for. The charts document the
+		// empty string as the way to deselect one of these two mutually exclusive
+		// tunables, so both spellings must normalise to the same "not provided".
+		experimentDetails.FilesystemUtilizationPercentage = types.Getenv("FILESYSTEM_UTILIZATION_PERCENTAGE", "0")
+		experimentDetails.FilesystemUtilizationBytes = types.Getenv("FILESYSTEM_UTILIZATION_BYTES", "0")
 		experimentDetails.NumberOfWorkers = types.Getenv("NUMBER_OF_WORKERS", "4")
 		experimentDetails.VolumeMountPath = types.Getenv("VOLUME_MOUNT_PATH", "")
 		experimentDetails.CPUcores = types.Getenv("CPU_CORES", "0")

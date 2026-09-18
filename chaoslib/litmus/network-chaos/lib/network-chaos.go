@@ -172,6 +172,14 @@ func createHelperPod(ctx context.Context, experimentsDetails *experimentTypes.Ex
 	ctx, span := otel.Tracer(telemetry.TracerName).Start(ctx, "CreatePodNetworkFaultHelperPod")
 	defer span.End()
 
+	// Correct the container-runtime socket for the node this helper will land on.
+	// Every chart ships SOCKET_PATH=/run/containerd/containerd.sock, which is right
+	// for KinD/kubeadm but wrong on k3s — there the generic socket connects yet
+	// reports "container not found" for every ID, so PID resolution fails and the
+	// fault dies before injecting. Resolved per node (not once per experiment) so a
+	// mixed-runtime cluster is handled; an explicit non-default SOCKET_PATH wins.
+	experimentsDetails.SocketPath = common.ResolveSocketPathForNode(ctx, clients, nodeName, experimentsDetails.SocketPath)
+
 	var (
 		privilegedEnable              = true
 		terminationGracePeriodSeconds = int64(experimentsDetails.TerminationGracePeriodSeconds)

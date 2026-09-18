@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/litmuschaos/litmus-go/pkg/clients"
 	"github.com/litmuschaos/litmus-go/pkg/log"
@@ -39,10 +40,15 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 
 	workloadName := os.Getenv("SURGE_WORKLOAD_NAME")
 	surgeImage := os.Getenv("SURGE_IMAGE")
-	requestsPerSecond, _ := strconv.Atoi(os.Getenv("REQUESTS_PER_SECOND"))
-	surgeReplicas, _ := strconv.Atoi(os.Getenv("SURGE_REPLICAS"))
-	if surgeReplicas <= 0 {
-		surgeReplicas = 1
+	// Discarding these parse errors would silently degrade a 1000 req/s surge to the
+	// rpsPerPod<1 clamp of 1 req/s -- not a detectable API-server surge, yet still Passed.
+	requestsPerSecond, err := strconv.Atoi(strings.TrimSpace(os.Getenv("REQUESTS_PER_SECOND")))
+	if err != nil || requestsPerSecond <= 0 {
+		return fmt.Errorf("REQUESTS_PER_SECOND must be a positive integer, got %q", os.Getenv("REQUESTS_PER_SECOND"))
+	}
+	surgeReplicas, err := strconv.Atoi(strings.TrimSpace(os.Getenv("SURGE_REPLICAS")))
+	if err != nil || surgeReplicas <= 0 {
+		return fmt.Errorf("SURGE_REPLICAS must be a positive integer, got %q", os.Getenv("SURGE_REPLICAS"))
 	}
 	rpsPerPod := requestsPerSecond / surgeReplicas
 	if rpsPerPod < 1 {
@@ -129,27 +135,47 @@ echo "load generation complete"
 	rbClient := cs.DynamicClient.Resource(gvrRoleBindings).Namespace(namespace)
 	deployClient := cs.DynamicClient.Resource(itbench.GVRDeployments).Namespace(namespace)
 
-	if _, err := saClient.Create(ctx, sa, metav1.CreateOptions{}); err != nil {
-		return fmt.Errorf("creating serviceaccount: %w", err)
-	}
-	if _, err := roleClient.Create(ctx, role, metav1.CreateOptions{}); err != nil {
-		return fmt.Errorf("creating role: %w", err)
-	}
-	if _, err := rbClient.Create(ctx, roleBinding, metav1.CreateOptions{}); err != nil {
-		return fmt.Errorf("creating rolebinding: %w", err)
-	}
-	if _, err := deployClient.Create(ctx, deployment, metav1.CreateOptions{}); err != nil {
-		return fmt.Errorf("creating surge deployment: %w", err)
+	// Each object is registered for deletion the moment it exists: all four share one fixed
+	// name, so anything left behind by a partial create or an abort makes every later run
+	// fail with AlreadyExists.
+	var cleanups []func(ctx context.Context)
+	defer func() {
+		revertCtx, cancel := itbench.RevertContext()
+		defer cancel()
+		log.Infof("Reverting: deleting %s surge workload and its RBAC from %s", workloadName, namespace)
+		for i := len(cleanups) - 1; i >= 0; i-- {
+			cleanups[i](revertCtx)
+		}
+	}()
+
+	create := func(rc namespacedClient, obj *unstructured.Unstructured, kind string) error {
+		if _, err := rc.Create(ctx, obj, metav1.CreateOptions{}); err != nil {
+			return fmt.Errorf("creating %s: %w", kind, err)
+		}
+		cleanups = append(cleanups, func(c context.Context) { deleteIgnoreNotFound(c, rc, workloadName) })
+		return nil
 	}
 
-	itbench.Sleep(ctx, chaosDetails.ChaosDuration)
+	if err := create(saClient, sa, "serviceaccount"); err != nil {
+		return err
+	}
+	if err := create(roleClient, role, "role"); err != nil {
+		return err
+	}
+	if err := create(rbClient, roleBinding, "rolebinding"); err != nil {
+		return err
+	}
+	if err := create(deployClient, deployment, "surge deployment"); err != nil {
+		return err
+	}
 
-	log.Infof("Reverting: deleting %s surge workload and its RBAC from %s", workloadName, namespace)
-	deleteIgnoreNotFound(ctx, deployClient, workloadName)
-	deleteIgnoreNotFound(ctx, rbClient, workloadName)
-	deleteIgnoreNotFound(ctx, roleClient, workloadName)
-	deleteIgnoreNotFound(ctx, saClient, workloadName)
+	itbench.HoldChaos(ctx, chaosDetails)
 	return nil
+}
+
+type namespacedClient interface {
+	Create(ctx context.Context, obj *unstructured.Unstructured, opts metav1.CreateOptions, subresources ...string) (*unstructured.Unstructured, error)
+	Delete(ctx context.Context, name string, opts metav1.DeleteOptions, subresources ...string) error
 }
 
 func deleteIgnoreNotFound(ctx context.Context, rc interface {

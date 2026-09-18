@@ -10,21 +10,25 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/litmuschaos/litmus-go/pkg/clients"
 	"github.com/litmuschaos/litmus-go/pkg/log"
 	itbench "github.com/litmuschaos/litmus-go/pkg/itbench/common"
 	"github.com/litmuschaos/litmus-go/pkg/types"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/dynamic"
 )
 
 func Run(ctx context.Context, cs clients.ClientSets) {
 	itbench.Run(ctx, cs, inject)
 }
 
-func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.ChaosDetails) error {
+func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.ChaosDetails) (retErr error) {
 	if len(chaosDetails.AppDetail) == 0 {
 		return fmt.Errorf("no target resolved: TARGETS env var was empty/unset")
 	}
@@ -39,7 +43,12 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 		svcName = svcTarget.GetName()
 	}
 
-	servicePort := os.Getenv("SERVICE_PORT")
+	servicePort := strings.TrimSpace(os.Getenv("SERVICE_PORT"))
+	if n, err := strconv.Atoi(servicePort); err != nil || n < 1 || n > 65535 {
+		// An empty port yields "http://svc.ns.svc.cluster.local:/path", which curl rejects --
+		// the fault would hold for its full duration having sent zero requests.
+		return fmt.Errorf("SERVICE_PORT must be a port number in 1-65535, got %q", servicePort)
+	}
 	requestPath := os.Getenv("REQUEST_PATH")
 	requestMethod := os.Getenv("REQUEST_METHOD")
 	tamperedBody := os.Getenv("TAMPERED_BODY")
@@ -83,25 +92,51 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 	if _, err := podClient.Create(ctx, pod, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("creating generator pod: %w", err)
 	}
-
-	log.Info("Waiting for generator pod to become Ready (best-effort)")
-	deadline := time.Now().Add(60 * time.Second)
-	for time.Now().Before(deadline) {
-		p, err := podClient.Get(ctx, genPodName, metav1.GetOptions{})
-		if err == nil {
-			phase, _, _ := unstructured.NestedString(p.Object, "status", "phase")
-			if phase == "Running" || phase == "Succeeded" {
-				break
+	defer func() {
+		revertCtx, cancel := itbench.RevertContext()
+		defer cancel()
+		log.Info("Reverting: no application state was ever modified -- stopping synthetic traffic by removing the generator pod")
+		if err := podClient.Delete(revertCtx, genPodName, metav1.DeleteOptions{}); err != nil && !k8serrors.IsNotFound(err) {
+			log.Errorf("failed to delete generator pod %s: %v", genPodName, err)
+			if retErr == nil {
+				retErr = fmt.Errorf("deleting generator pod: %w", err)
 			}
 		}
-		time.Sleep(2 * time.Second)
+	}()
+
+	// Without this the fault holds its full duration having sent zero requests (e.g. the
+	// generator image is stuck in ImagePullBackOff) and still reports success.
+	log.Info("Waiting for the generator pod to start")
+	if err := waitForPodRunning(ctx, podClient, genPodName, 60*time.Second); err != nil {
+		return err
 	}
 
-	itbench.Sleep(ctx, chaosDetails.ChaosDuration)
-
-	log.Info("Reverting: no application state was ever modified -- stopping synthetic traffic by removing the generator pod")
-	if err := podClient.Delete(ctx, genPodName, metav1.DeleteOptions{}); err != nil {
-		return fmt.Errorf("deleting generator pod: %w", err)
-	}
+	itbench.HoldChaos(ctx, chaosDetails)
 	return nil
+}
+
+func waitForPodRunning(ctx context.Context, podClient dynamic.ResourceInterface, name string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	lastPhase, lastErr := "", error(nil)
+	for time.Now().Before(deadline) {
+		p, err := podClient.Get(ctx, name, metav1.GetOptions{})
+		if err == nil {
+			lastErr = nil
+			lastPhase, _, _ = unstructured.NestedString(p.Object, "status", "phase")
+			if lastPhase == "Running" || lastPhase == "Succeeded" {
+				return nil
+			}
+			if lastPhase == "Failed" {
+				return fmt.Errorf("generator pod %s entered phase Failed -- no synthetic traffic was sent", name)
+			}
+		} else {
+			lastErr = err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+	return fmt.Errorf("generator pod %s never reached Running within %s (last phase=%q, last error=%v) -- no synthetic traffic was sent", name, timeout, lastPhase, lastErr)
 }

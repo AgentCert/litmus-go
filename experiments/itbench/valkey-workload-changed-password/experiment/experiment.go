@@ -17,13 +17,14 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/dynamic"
 )
 
 func Run(ctx context.Context, cs clients.ClientSets) {
 	itbench.Run(ctx, cs, inject)
 }
 
-func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.ChaosDetails) error {
+func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.ChaosDetails) (retErr error) {
 	secretName := os.Getenv("VALKEY_SECRET_NAME")
 	secretKey := os.Getenv("VALKEY_SECRET_KEY")
 	faultPassword := os.Getenv("FAULT_PASSWORD")
@@ -63,6 +64,21 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 		}
 	}
 
+	// Deferred from here on: the Secret is poisoned before the container is touched, so a
+	// failure in the container patch (or an abort) would otherwise leave the valkey
+	// credentials broken for every later run -- and the next run would then capture the
+	// fault password as its "original".
+	defer func() {
+		revertCtx, cancel := itbench.RevertContext()
+		defer cancel()
+		if err := revertSecret(revertCtx, secretClient, secretName, secretKey, origSecretValue, secretExisted); err != nil {
+			log.Errorf("failed to restore Secret %s -- valkey stays broken: %v", secretName, err)
+			if retErr == nil {
+				retErr = err
+			}
+		}
+	}()
+
 	// --- Container: force valkey-server --requirepass $(VALKEY_PASSWORD) ---
 	envVar := map[string]interface{}{
 		"name": "VALKEY_PASSWORD",
@@ -70,33 +86,32 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 			"secretKeyRef": map[string]interface{}{"name": secretName, "key": secretKey},
 		},
 	}
-	err := itbench.PatchContainerFields(ctx, cs, chaosDetails, []itbench.ContainerFieldSpec{
+	return itbench.PatchContainerFields(ctx, cs, chaosDetails, []itbench.ContainerFieldSpec{
 		{Path: []string{"command"}, NewValue: []string{"valkey-server"}},
 		{Path: []string{"args"}, NewValue: []string{"--requirepass", "$(VALKEY_PASSWORD)"}},
 		{Path: []string{"env"}, NewValue: []interface{}{envVar}},
 	})
-	if err != nil {
-		return err
-	}
+}
 
-	// --- Revert Secret ---
-	if secretExisted {
-		log.Infof("Reverting: restoring original %s/%s value", secretName, secretKey)
-		current, err := secretClient.Get(ctx, secretName, metav1.GetOptions{})
-		if err != nil {
-			return err
-		}
-		if err := unstructured.SetNestedField(current.Object, origSecretValue, "data", secretKey); err != nil {
-			return err
-		}
-		if _, err := secretClient.Update(ctx, current, metav1.UpdateOptions{}); err != nil {
-			return err
-		}
-	} else {
+func revertSecret(ctx context.Context, secretClient dynamic.ResourceInterface, secretName, secretKey, origValue string, existed bool) error {
+	if !existed {
 		log.Infof("Reverting: deleting Secret %s (did not exist before injection)", secretName)
 		if err := secretClient.Delete(ctx, secretName, metav1.DeleteOptions{}); err != nil && !k8serrors.IsNotFound(err) {
 			return err
 		}
+		return nil
 	}
-	return nil
+	log.Infof("Reverting: restoring original %s/%s value", secretName, secretKey)
+	current, err := secretClient.Get(ctx, secretName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	// stringData is write-only and is what injection set; clearing it lets the restored
+	// base64 data value take effect again.
+	unstructured.RemoveNestedField(current.Object, "stringData", secretKey)
+	if err := unstructured.SetNestedField(current.Object, origValue, "data", secretKey); err != nil {
+		return err
+	}
+	_, err = secretClient.Update(ctx, current, metav1.UpdateOptions{})
+	return err
 }
