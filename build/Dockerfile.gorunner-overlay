@@ -1,0 +1,37 @@
+# Overlay image: upstream go-runner, with the experiment/helper binaries rebuilt
+# from THIS checkout.
+#
+# Why not build/Dockerfile? That one reconstructs the whole runtime from scratch
+# -- RPMs from three distro vaults plus four GitHub release downloads -- which is
+# slow and fails outright on a flaky or proxied network. Everything it installs
+# (tc, iptables, stress-ng, kubectl, crictl, promql, pause) is already present in
+# the published go-runner image and is not what we change; only the Go binaries
+# are. Overlaying them keeps the runtime byte-identical to upstream and cuts the
+# build to a single Go compile.
+#
+# This matters for grading: the generic faults (pod-cpu-hog, pod-memory-hog,
+# pod-network-loss, ...) run from go-runner, NOT from itbench-experiment, so
+# without this overlay they keep running upstream's prebuilt binary and never
+# pick up pkg/result's verdict changes -- which is exactly the path that was
+# awarding a free 100%.
+#
+# Build with:
+#   docker build -f build/Dockerfile.gorunner-overlay \
+#     --provenance=false --platform linux/amd64 --output type=docker \
+#     -t litmuschaos/go-runner:latest .
+# The buildx flags are required: the default output is a manifest list with an
+# attestation manifest, which `kind load docker-image` rejects.
+FROM golang:1.22 AS builder
+
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
+WORKDIR /litmus-go
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /output/experiments ./bin/experiment
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /output/helpers ./bin/helper
+
+FROM litmuschaos/go-runner:latest
+COPY --from=builder /output/experiments /litmus/experiments
+COPY --from=builder /output/helpers /litmus/helpers

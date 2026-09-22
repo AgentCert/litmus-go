@@ -62,6 +62,14 @@ type ResultDetails struct {
 	ProbeDetails     []*ProbeDetails
 	PassedProbeCount int
 	ProbeArtifacts   map[string]ProbeArtifact
+
+	// Graded records whether anything actually evaluated the agent's remediation for
+	// this run. A Pass that was never graded carries no evidence and is reported as
+	// verdict N/A rather than a 100% score -- see pkg/result/grading.go.
+	Graded bool
+	// GradingDetail is the human-readable reason behind Graded, surfaced on the
+	// ChaosResult as a synthetic probe entry so a run can be diagnosed after the fact.
+	GradingDetail string
 }
 
 // ProbeArtifact contains the probe artifacts

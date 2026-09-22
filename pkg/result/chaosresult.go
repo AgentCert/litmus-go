@@ -175,6 +175,13 @@ func updateResultAttributes(clients clients.ClientSets, chaosDetails *types.Chao
 			}
 			result.Status.ExperimentStatus.Verdict = resultDetails.Verdict
 		}
+		// A Pass nothing ever graded is not evidence of a resilient agent -- see
+		// grading.go. Runs before the verdict switch so the N/A branch is reached.
+		downgradeUngradedPass(resultDetails)
+		result.Status.ExperimentStatus.Verdict = resultDetails.Verdict
+		if gradingStatus, ok := gradingProbeStatus(resultDetails); ok {
+			result.Status.ProbeStatuses = append(result.Status.ProbeStatuses, gradingStatus)
+		}
 		switch strings.ToLower(string(resultDetails.Verdict)) {
 		case "pass":
 			result.Status.ExperimentStatus.ProbeSuccessPercentage = "100"
@@ -197,6 +204,11 @@ func updateResultAttributes(clients clients.ClientSets, chaosDetails *types.Chao
 			} else {
 				result.Status.ExperimentStatus.ProbeSuccessPercentage = "0"
 			}
+		case "n/a":
+			// Ungraded: the fault ran but nothing could assert whether it was
+			// remediated. A numeric 0 keeps consumers parsing cleanly; the verdict
+			// is what tells them to exclude this fault from scoring.
+			result.Status.ExperimentStatus.ProbeSuccessPercentage = "0"
 		}
 	default:
 		result.Status.ExperimentStatus.ProbeSuccessPercentage = "Awaited"

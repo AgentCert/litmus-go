@@ -11,11 +11,11 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/litmuschaos/chaos-operator/api/litmuschaos/v1alpha1"
 	"github.com/litmuschaos/litmus-go/pkg/cerrors"
 	"github.com/litmuschaos/litmus-go/pkg/clients"
 	"github.com/litmuschaos/litmus-go/pkg/events"
@@ -117,75 +117,136 @@ func RevertContext() (context.Context, context.CancelFunc) {
 //   - deployment/statefulset : status.readyReplicas >= 1
 //   - pod                    : at least one matching pod is Ready
 //   - service                : the Service's Endpoints has >= 1 ready address
-//   - any other kind         : no assertion (ok=true) -- can't generically tell
+//   - horizontalpodautoscaler: spec targets no longer match the injected values
+//   - any other kind         : ungraded -- can't generically tell
 //
-// A *query* failure also returns ok=true (with a note): an inability to check is not the
-// agent's fault and must never fail the run. Teardown experiments (uninstall-*) are
-// skipped outright. Gated by ITBENCH_DEFAULT_RECOVERY_CHECK (default on; "false"/"0"/"no"
-// disables). See OPEN_WEIGHT_CERTIFICATION_HANDOFF.md §122.
-func defaultRecoveryAssertion(ctx context.Context, cs clients.ClientSets, chaosDetails *types.ChaosDetails) (ok bool, detail string) {
+// graded=false means the run could not be judged at all (assertion disabled, no target
+// resolved, unsupported kind, or the lookup itself failed); ok is meaningless then. Those
+// cases must not report Pass: an inability to measure is not evidence the agent did
+// anything, and returning Pass here is exactly what awarded a free 100%. They are
+// reported as verdict N/A and dropped from the resiliency-score denominator instead. An
+// inability to check is still never the agent's fault, so it is never a Fail either.
+//
+// Teardown experiments (uninstall-*) and an explicitly disabled check are graded passes:
+// both are deliberate operator choices rather than measurement gaps. Gated by
+// ITBENCH_DEFAULT_RECOVERY_CHECK (default on; "false"/"0"/"no" disables).
+// See OPEN_WEIGHT_CERTIFICATION_HANDOFF.md §122.
+func defaultRecoveryAssertion(ctx context.Context, cs clients.ClientSets, chaosDetails *types.ChaosDetails) (graded, ok bool, detail string) {
 	switch v := strings.ToLower(strings.TrimSpace(os.Getenv("ITBENCH_DEFAULT_RECOVERY_CHECK"))); v {
 	case "false", "0", "no", "off":
-		return true, "disabled via ITBENCH_DEFAULT_RECOVERY_CHECK"
+		return true, true, "recovery assertion disabled via ITBENCH_DEFAULT_RECOVERY_CHECK"
 	}
 	if strings.HasPrefix(strings.ToLower(chaosDetails.ExperimentName), "uninstall-") {
-		return true, "teardown experiment -- no recovery assertion"
+		return true, true, "teardown experiment -- not graded on remediation"
 	}
 	if len(chaosDetails.AppDetail) == 0 {
-		return true, "no target resolved (TARGETS unset) -- nothing to assert"
+		return false, false, "no target resolved (TARGETS unset) -- nothing to assert"
 	}
 	app := chaosDetails.AppDetail[0]
 	switch strings.ToLower(app.Kind) {
 	case "deployment", "deployments", "statefulset", "statefulsets":
 		gvr, err := WorkloadGVRForKind(app.Kind)
 		if err != nil {
-			return true, "unknown workload kind: " + err.Error()
+			return false, false, "unknown workload kind: " + err.Error()
 		}
 		obj, err := ResolveTarget(ctx, cs, gvr, chaosDetails)
 		if err != nil {
-			return true, "could not resolve target workload (skipping): " + err.Error()
+			return false, false, "could not resolve target workload: " + err.Error()
 		}
 		ready, _, _ := unstructured.NestedInt64(obj.Object, "status", "readyReplicas")
 		if ready >= 1 {
-			return true, fmt.Sprintf("%s/%s readyReplicas=%d", gvr.Resource, obj.GetName(), ready)
+			return true, true, fmt.Sprintf("%s/%s readyReplicas=%d -- target restored", gvr.Resource, obj.GetName(), ready)
 		}
-		return false, fmt.Sprintf("%s/%s still has readyReplicas=%d -- target not restored", gvr.Resource, obj.GetName(), ready)
+		return true, false, fmt.Sprintf("%s/%s still has readyReplicas=%d -- target not restored", gvr.Resource, obj.GetName(), ready)
 	case "pod", "pods":
 		pods, err := ResolveTargets(ctx, cs, GVRPods, chaosDetails)
 		if err != nil || len(pods) == 0 {
-			return true, "could not resolve target pods (skipping)"
+			return false, false, "could not resolve target pods"
 		}
 		for _, p := range pods {
 			conds, _, _ := unstructured.NestedSlice(p.Object, "status", "conditions")
 			for _, c := range conds {
 				if m, _ := c.(map[string]interface{}); m["type"] == "Ready" && m["status"] == "True" {
-					return true, fmt.Sprintf("pod %s is Ready", p.GetName())
+					return true, true, fmt.Sprintf("pod %s is Ready -- target restored", p.GetName())
 				}
 			}
 		}
-		return false, "no target pod is Ready -- target not restored"
+		return true, false, "no target pod is Ready -- target not restored"
 	case "service", "services":
 		svc, err := ResolveTarget(ctx, cs, GVRServices, chaosDetails)
 		if err != nil {
-			return false, "target Service not found -- not restored: " + err.Error()
+			return true, false, "target Service not found -- not restored: " + err.Error()
 		}
 		epsGVR := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "endpoints"}
 		eps, err := cs.DynamicClient.Resource(epsGVR).Namespace(svc.GetNamespace()).Get(ctx, svc.GetName(), metav1.GetOptions{})
 		if err != nil {
-			return false, fmt.Sprintf("Service %s has no Endpoints object -- not restored", svc.GetName())
+			return true, false, fmt.Sprintf("Service %s has no Endpoints object -- not restored", svc.GetName())
 		}
 		subsets, _, _ := unstructured.NestedSlice(eps.Object, "subsets")
 		for _, s := range subsets {
 			if m, _ := s.(map[string]interface{}); m != nil {
 				if addrs, ok := m["addresses"].([]interface{}); ok && len(addrs) > 0 {
-					return true, fmt.Sprintf("Service %s has %d ready endpoint address(es)", svc.GetName(), len(addrs))
+					return true, true, fmt.Sprintf("Service %s has %d ready endpoint address(es) -- target restored", svc.GetName(), len(addrs))
 				}
 			}
 		}
-		return false, fmt.Sprintf("Service %s has 0 ready endpoint addresses -- not restored", svc.GetName())
+		return true, false, fmt.Sprintf("Service %s has 0 ready endpoint addresses -- not restored", svc.GetName())
+	case "horizontalpodautoscaler", "horizontalpodautoscalers", "hpa":
+		return hpaRecoveryAssertion(ctx, cs, chaosDetails)
 	default:
-		return true, "no built-in recovery assertion for kind " + app.Kind
+		return false, false, "no built-in recovery assertion for kind " + app.Kind
 	}
+}
+
+// hpaRecoveryAssertion grades misconfigured-kubernetes-horizontal-pod-autoscaler, whose
+// damage is a *configuration* value rather than an unready workload -- readyReplicas stays
+// healthy throughout, so the generic workload assertion would report a free pass.
+//
+// The fault sets the HPA's cpu/memory utilization targets to CPU_UTILIZATION_PERCENT /
+// MEMORY_UTILIZATION_PERCENT. The agent has remediated it when the live targets no longer
+// match those injected values. With neither env var set there is nothing to compare
+// against, so the run is ungraded rather than passed.
+func hpaRecoveryAssertion(ctx context.Context, cs clients.ClientSets, chaosDetails *types.ChaosDetails) (graded, ok bool, detail string) {
+	injected := map[string]string{}
+	for resourceName, envName := range map[string]string{
+		"cpu":    "CPU_UTILIZATION_PERCENT",
+		"memory": "MEMORY_UTILIZATION_PERCENT",
+	} {
+		if v := strings.TrimSpace(os.Getenv(envName)); v != "" {
+			injected[resourceName] = v
+		}
+	}
+	if len(injected) == 0 {
+		return false, false, "no injected HPA utilization values (CPU_/MEMORY_UTILIZATION_PERCENT unset) -- nothing to compare against"
+	}
+
+	obj, err := ResolveTarget(ctx, cs, GVRHPA, chaosDetails)
+	if err != nil {
+		return false, false, "could not resolve target HorizontalPodAutoscaler: " + err.Error()
+	}
+
+	metrics, _, _ := unstructured.NestedSlice(obj.Object, "spec", "metrics")
+	var stillInjected []string
+	for _, m := range metrics {
+		entry, _ := m.(map[string]interface{})
+		if entry == nil {
+			continue
+		}
+		resourceName, _, _ := unstructured.NestedString(entry, "resource", "name")
+		want, tracked := injected[strings.ToLower(resourceName)]
+		if !tracked {
+			continue
+		}
+		live, found, _ := unstructured.NestedInt64(entry, "resource", "target", "averageUtilization")
+		if found && strconv.FormatInt(live, 10) == want {
+			stillInjected = append(stillInjected, fmt.Sprintf("%s=%d", resourceName, live))
+		}
+	}
+	if len(stillInjected) > 0 {
+		return true, false, fmt.Sprintf("HPA %s still carries the injected utilization target(s) %s -- not remediated",
+			obj.GetName(), strings.Join(stillInjected, ", "))
+	}
+	return true, true, fmt.Sprintf("HPA %s no longer matches the injected utilization target(s) -- remediated", obj.GetName())
 }
 
 // recordAbort writes the "Stopped" ChaosResult and the abort events -- the same bookkeeping
@@ -307,6 +368,8 @@ func Run(ctx context.Context, cs clients.ClientSets, inject InjectFunc) {
 	hasExplicitProbes := chaosDetails.EngineName != "" && len(resultDetails.ProbeDetails) != 0
 	var probeErr error
 	defaultCheckFail := ""
+	defaultCheckGraded := false
+	defaultCheckDetail := ""
 	midChaosRan := false
 	if chaosDetails.EngineName != "" {
 		setMidChaosHook(func(hookCtx context.Context) {
@@ -321,10 +384,14 @@ func Run(ctx context.Context, cs clients.ClientSets, inject InjectFunc) {
 				}
 				return
 			}
-			ok, why := defaultRecoveryAssertion(hookCtx, cs, &chaosDetails)
-			if ok {
+			graded, ok, why := defaultRecoveryAssertion(hookCtx, cs, &chaosDetails)
+			defaultCheckGraded, defaultCheckDetail = graded, why
+			switch {
+			case !graded:
+				log.Warnf("[Recovery]: run is NOT graded (%s)", why)
+			case ok:
 				log.Infof("[Recovery]: default recovery assertion passed (%s)", why)
-			} else {
+			default:
 				defaultCheckFail = why
 				log.Errorf("[Recovery]: default recovery assertion FAILED (%s)", why)
 			}
@@ -372,9 +439,13 @@ func Run(ctx context.Context, cs clients.ClientSets, inject InjectFunc) {
 			if err := probe.RunProbes(ctx, &chaosDetails, cs, &resultDetails, "PostChaos", &eventsDetails); err != nil {
 				probeErr = err
 			}
-		} else if ok, why := defaultRecoveryAssertion(ctx, cs, &chaosDetails); !ok {
-			defaultCheckFail = why
-			log.Errorf("[Recovery]: default recovery assertion FAILED post-revert (%s)", why)
+		} else {
+			graded, ok, why := defaultRecoveryAssertion(ctx, cs, &chaosDetails)
+			defaultCheckGraded, defaultCheckDetail = graded, why
+			if graded && !ok {
+				defaultCheckFail = why
+				log.Errorf("[Recovery]: default recovery assertion FAILED post-revert (%s)", why)
+			}
 		}
 	}
 
@@ -383,15 +454,21 @@ func Run(ctx context.Context, cs clients.ClientSets, inject InjectFunc) {
 		result.RecordAfterFailure(&chaosDetails, &resultDetails, probeErr, cs, &eventsDetails)
 		return
 	}
-	if defaultCheckFail != "" {
-		// No explicit probe, and the built-in recovery assertion says the agent did
-		// not restore the target. Mark the run Failed and fall through to the normal
-		// EOT ChaosResult write, which -- for a no-probe experiment -- records
-		// Verdict=Fail + probeSuccessPercentage=0 (pkg/result/chaosresult.go).
+	switch {
+	case hasExplicitProbes:
+		// Explicit probes already graded this run; probeErr above is their verdict.
+		result.MarkGraded(&resultDetails, true, "recovery probe(s) passed -- target restored")
+	case defaultCheckFail != "":
+		// The built-in recovery assertion says the agent did not restore the target.
 		log.Errorf("[Recovery]: marking experiment Failed -- %s", defaultCheckFail)
-		resultDetails.Verdict = v1alpha1.ResultVerdictFailed
-	} else {
-		resultDetails.Verdict = v1alpha1.ResultVerdictPassed
+		result.MarkGraded(&resultDetails, false, defaultCheckFail)
+	case defaultCheckGraded:
+		result.MarkGraded(&resultDetails, true, defaultCheckDetail)
+	default:
+		// Nothing could judge the agent's remediation. Reported as N/A and dropped from
+		// the resiliency-score denominator -- never as a free Pass.
+		log.Warnf("[Recovery]: marking experiment N/A -- %s", defaultCheckDetail)
+		result.MarkUngraded(&resultDetails, defaultCheckDetail)
 	}
 
 	log.Infof("[The End]: Updating the chaos result of %v experiment (EOT)", chaosDetails.ExperimentName)
