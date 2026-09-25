@@ -99,9 +99,10 @@ func PatchContainerField(ctx context.Context, cs clients.ClientSets, chaosDetail
 // RemoveContainerField resolves the target container and, if containerFieldPath exists,
 // removes it entirely (JSON-patch "remove", matching strategic-merge's "set to null
 // deletes the field" semantics), holds, then restores the original value. If the field is
-// already absent, this is a no-op (still holds for ChaosDuration, matching the original
-// scripts' behavior of running the no-op patch anyway). Used by faults whose injection
-// itself is a deletion, not a replacement (e.g. unassigned-resource-limits).
+// already absent it returns an error rather than holding: removing nothing is not an
+// injection, and reporting success would grade a run that never mutated the cluster.
+// Used by faults whose injection itself is a deletion, not a replacement (e.g.
+// unassigned-resource-limits).
 func RemoveContainerField(ctx context.Context, cs clients.ClientSets, chaosDetails *types.ChaosDetails, containerFieldPath []string) error {
 	if len(chaosDetails.AppDetail) == 0 {
 		return fmt.Errorf("no target resolved: TARGETS env var was empty/unset")
