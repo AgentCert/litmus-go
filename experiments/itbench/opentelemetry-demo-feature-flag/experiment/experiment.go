@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/litmuschaos/litmus-go/pkg/clients"
 	"github.com/litmuschaos/litmus-go/pkg/log"
@@ -22,6 +23,11 @@ import (
 
 const configMapName = "flagd-config"
 const dataKey = "demo.flagd.json"
+
+// flagdDeployment serves the flags. Its init container copies the ConfigMap
+// into an emptyDir once at pod start and flagd reads only that copy, so a
+// ConfigMap edit takes effect only when the pod is recreated.
+const flagdDeployment = "flagd"
 
 func Run(ctx context.Context, cs clients.ClientSets) {
 	itbench.Run(ctx, cs, inject)
@@ -68,6 +74,10 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 	if err := patchConfigMapData(ctx, cmClient, configMapName, injected); err != nil {
 		return err
 	}
+	namespace := chaosDetails.AppDetail[0].Namespace
+	if err := restartFlagd(ctx, cs, namespace); err != nil {
+		return fmt.Errorf("flag written but flagd was not restarted to load it: %w", err)
+	}
 
 	itbench.HoldChaos(ctx, chaosDetails)
 
@@ -79,7 +89,33 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 		return err
 	}
 	log.Infof("Reverting: restoring %s.defaultVariant=%s", flagName, origVariant)
-	return patchConfigMapData(revertCtx, cmClient, configMapName, reverted)
+	if err := patchConfigMapData(revertCtx, cmClient, configMapName, reverted); err != nil {
+		return err
+	}
+	return restartFlagd(revertCtx, cs, namespace)
+}
+
+// restartFlagd recreates the flagd pod (as `kubectl rollout restart` does) so
+// its init container copies the current ConfigMap.
+func restartFlagd(ctx context.Context, cs clients.ClientSets, namespace string) error {
+	rc := cs.DynamicClient.Resource(itbench.GVRDeployments).Namespace(namespace)
+	obj, err := rc.Get(ctx, flagdDeployment, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	annotations, _, _ := unstructured.NestedStringMap(obj.Object, "spec", "template", "metadata", "annotations")
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations["kubectl.kubernetes.io/restartedAt"] = time.Now().Format(time.RFC3339Nano)
+	if err := unstructured.SetNestedStringMap(obj.Object, annotations, "spec", "template", "metadata", "annotations"); err != nil {
+		return err
+	}
+	if _, err := rc.Update(ctx, obj, metav1.UpdateOptions{}); err != nil {
+		return err
+	}
+	log.Infof("Restarted deployment %s/%s to load the flag configuration", namespace, flagdDeployment)
+	return nil
 }
 
 // setDefaultVariant parses flagdJSON, sets flags[flagName].defaultVariant=newVariant, and

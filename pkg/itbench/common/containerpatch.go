@@ -45,6 +45,20 @@ func ContainerIndex(target *unstructured.Unstructured, containerName string) (in
 	return -1, fmt.Errorf("container %q not found on %s", containerName, target.GetName())
 }
 
+// soleContainer returns the only container of a single-container workload.
+func soleContainer(target *unstructured.Unstructured) (int, string, bool) {
+	containers, found, err := unstructured.NestedSlice(target.Object, "spec", "template", "spec", "containers")
+	if err != nil || !found || len(containers) != 1 {
+		return -1, "", false
+	}
+	m, ok := containers[0].(map[string]interface{})
+	if !ok {
+		return -1, "", false
+	}
+	name, _ := m["name"].(string)
+	return 0, name, name != ""
+}
+
 // ResolveTargetWorkloadAndContainer resolves the target Deployment/StatefulSet via
 // TARGETS and locates the container named by TargetContainerName within it. Returns the
 // target object, its container index, and the container name (for logging).
@@ -62,6 +76,14 @@ func ResolveTargetWorkloadAndContainer(ctx context.Context, cs clients.ClientSet
 	}
 	containerName = TargetContainerName(target.GetName())
 	containerIdx, err = ContainerIndex(target, containerName)
+	if err != nil && os.Getenv("TARGET_CONTAINER") == "" {
+		// The workload-name convention does not hold for every app (bookinfo's
+		// Deployment details-v1 runs container "details"); a single-container
+		// workload is unambiguous, so act on that container.
+		if idx, name, ok := soleContainer(target); ok {
+			containerIdx, containerName, err = idx, name, nil
+		}
+	}
 	if err != nil {
 		return nil, -1, "", err
 	}

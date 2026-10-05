@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/litmuschaos/chaos-operator/api/litmuschaos/v1alpha1"
 	"github.com/litmuschaos/litmus-go/pkg/cerrors"
 	"github.com/litmuschaos/litmus-go/pkg/clients"
 	"github.com/litmuschaos/litmus-go/pkg/events"
@@ -42,13 +43,10 @@ type InjectFunc func(ctx context.Context, cs clients.ClientSets, chaosDetails *t
 // fault has been held for its full ChaosDuration but BEFORE the helper reverts it -- the
 // last moment the injected fault is still live.
 //
-// This exists because every itbench fault self-reverts *inside* its own InjectFunc
-// (patch -> Sleep(ChaosDuration) -> revert), before Run() ever gets to call
-// probe.RunProbes(..., "PostChaos", ...). A recovery probe evaluated there (or at EOT)
-// checks the target *after the experiment already fixed it itself* -- it cannot tell
-// whether the agent under test did anything. Evaluating the probe here instead, at the
-// end of the hold but pre-revert, judges it against the agent's actual remediation
-// window. See OPEN_WEIGHT_CERTIFICATION_HANDOFF.md §120.
+// Run() uses it to log the target's state at that instant (see defaultRecoveryAssertion).
+// That is a record only: like the upstream generic faults, an itbench verdict says
+// whether the fault injected and reverted cleanly, never what the agent under test did.
+// The agent is judged by the certifier from its own trace.
 var (
 	midChaosHook   func(ctx context.Context)
 	midChaosHookMu sync.Mutex
@@ -83,10 +81,10 @@ func RunMidChaosHook(ctx context.Context) {
 func HoldChaos(ctx context.Context, chaosDetails *types.ChaosDetails) {
 	Sleep(ctx, chaosDetails.ChaosDuration)
 	if ctx.Err() != nil {
-		// Aborted mid-hold: skip the recovery assertion (the agent never got its full
-		// window, so judging it here would be meaningless) and fall straight through to
-		// the caller's revert, which runs on RevertContext and therefore still works.
-		log.Info("[Abort]: hold interrupted -- skipping the recovery check and reverting the fault now")
+		// Aborted mid-hold: skip the end-of-window observation (the window never ended)
+		// and fall straight through to the caller's revert, which runs on RevertContext
+		// and therefore still works.
+		log.Info("[Abort]: hold interrupted -- skipping the end-of-window observation and reverting the fault now")
 		return
 	}
 	RunMidChaosHook(ctx)
@@ -107,30 +105,21 @@ func RevertContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), RevertTimeout)
 }
 
-// defaultRecoveryAssertion is the built-in "did the agent restore the target?" check the
-// mid-chaos hook runs for an itbench fault whose ChaosEngine declares NO explicit probe.
-// It inspects the SDK-resolved target (chaosDetails.AppDetail[0]) at the end of the fault
-// hold, before the fault is reverted -- the same instant an explicit probe would be
-// evaluated -- so the ChaosResult verdict reflects the agent's remediation rather than
-// the experiment's own self-revert (which would make every no-probe run pass at 100%).
+// defaultRecoveryAssertion reports whether the SDK-resolved target
+// (chaosDetails.AppDetail[0]) looks restored at the end of the fault hold, before the
+// fault reverts it. Run() only logs the result as a record of the target's state; it
+// never decides the verdict.
 //
 //   - deployment/statefulset : status.readyReplicas >= 1
 //   - pod                    : at least one matching pod is Ready
 //   - service                : the Service's Endpoints has >= 1 ready address
 //   - horizontalpodautoscaler: spec targets no longer match the injected values
-//   - any other kind         : ungraded -- can't generically tell
+//   - any other kind         : not checked -- can't generically tell
 //
-// graded=false means the run could not be judged at all (assertion disabled, no target
-// resolved, unsupported kind, or the lookup itself failed); ok is meaningless then. Those
-// cases must not report Pass: an inability to measure is not evidence the agent did
-// anything, and returning Pass here is exactly what awarded a free 100%. They are
-// reported as verdict N/A and dropped from the resiliency-score denominator instead. An
-// inability to check is still never the agent's fault, so it is never a Fail either.
-//
-// Teardown experiments (uninstall-*) and an explicitly disabled check are graded passes:
-// both are deliberate operator choices rather than measurement gaps. Gated by
+// graded=false means nothing could be checked (check disabled, no target resolved,
+// unsupported kind, or the lookup itself failed); ok is meaningless then. Teardown
+// experiments (uninstall-*) are not checked either. Gated by
 // ITBENCH_DEFAULT_RECOVERY_CHECK (default on; "false"/"0"/"no" disables).
-// See OPEN_WEIGHT_CERTIFICATION_HANDOFF.md §122.
 func defaultRecoveryAssertion(ctx context.Context, cs clients.ClientSets, chaosDetails *types.ChaosDetails) (graded, ok bool, detail string) {
 	switch v := strings.ToLower(strings.TrimSpace(os.Getenv("ITBENCH_DEFAULT_RECOVERY_CHECK"))); v {
 	case "false", "0", "no", "off":
@@ -357,44 +346,13 @@ func Run(ctx context.Context, cs clients.ClientSets, inject InjectFunc) {
 		}
 	}
 
-	// Install the mid-chaos hook so any fault built on the shared patch helpers
-	// (HoldChaos, called from fieldpatch.go/containerpatch.go) evaluates recovery
-	// pre-revert, while the fault is still live:
-	//   - if the ChaosEngine declares explicit probe(s): run them (PostChaos phase)
-	//   - otherwise: run the built-in defaultRecoveryAssertion against the resolved target
-	// midChaosRan/probeErr/defaultCheckFail are only ever written from the hook, which
-	// runs synchronously inside inject() on the same goroutine that reads them below --
-	// no separate synchronization needed.
-	hasExplicitProbes := chaosDetails.EngineName != "" && len(resultDetails.ProbeDetails) != 0
-	var probeErr error
-	defaultCheckFail := ""
-	defaultCheckGraded := false
-	defaultCheckDetail := ""
-	midChaosRan := false
+	// Record the target's state at the end of the fault window, just before the fault
+	// reverts itself (HoldChaos runs this hook from every itbench patch helper). It is
+	// logged only and never affects the verdict.
 	if chaosDetails.EngineName != "" {
 		setMidChaosHook(func(hookCtx context.Context) {
-			midChaosRan = true
-			if hasExplicitProbes {
-				log.Info("[Probe]: Running recovery probes (fault still active, pre-revert)")
-				if err := probe.RunProbes(hookCtx, &chaosDetails, cs, &resultDetails, "PostChaos", &eventsDetails); err != nil {
-					// Captured, not returned: the patch helper still has to revert the
-					// fault so the cluster isn't left broken. Verdict is set below.
-					probeErr = err
-					log.Errorf("Recovery probe(s) failed -- target not restored within the fault window: %v", err)
-				}
-				return
-			}
-			graded, ok, why := defaultRecoveryAssertion(hookCtx, cs, &chaosDetails)
-			defaultCheckGraded, defaultCheckDetail = graded, why
-			switch {
-			case !graded:
-				log.Warnf("[Recovery]: run is NOT graded (%s)", why)
-			case ok:
-				log.Infof("[Recovery]: default recovery assertion passed (%s)", why)
-			default:
-				defaultCheckFail = why
-				log.Errorf("[Recovery]: default recovery assertion FAILED (%s)", why)
-			}
+			_, _, why := defaultRecoveryAssertion(hookCtx, cs, &chaosDetails)
+			log.Infof("[Observation]: end of fault window, before revert (recorded only, not graded): %s", why)
 		})
 		defer setMidChaosHook(nil)
 	}
@@ -417,7 +375,11 @@ func Run(ctx context.Context, cs clients.ClientSets, inject InjectFunc) {
 		return
 	}
 
+	// The fault injected, held and reverted cleanly: that is a Pass, exactly as in the
+	// upstream generic faults. Only explicit probes or the post-chaos health check
+	// below can still change it.
 	log.Infof("[Confirmation]: %v chaos has been injected successfully", chaosDetails.ExperimentName)
+	resultDetails.Verdict = v1alpha1.ResultVerdictPassed
 	chaosDetails.Phase = types.PostChaosPhase
 
 	if chaosDetails.DefaultHealthCheck {
@@ -429,46 +391,15 @@ func Run(ctx context.Context, cs clients.ClientSets, inject InjectFunc) {
 		}
 	}
 
-	// Fallback for a fault whose InjectFunc never called HoldChaos (not built on the
-	// shared patch helpers, e.g. a teardown step, or one with no hold-then-revert
-	// shape): evaluate here, post-revert -- weaker than the mid-chaos evaluation, but
-	// far better than never running the check at all, which would make such a fault
-	// report Passed unconditionally.
-	if chaosDetails.EngineName != "" && !midChaosRan {
-		if hasExplicitProbes {
-			if err := probe.RunProbes(ctx, &chaosDetails, cs, &resultDetails, "PostChaos", &eventsDetails); err != nil {
-				probeErr = err
-			}
-		} else {
-			graded, ok, why := defaultRecoveryAssertion(ctx, cs, &chaosDetails)
-			defaultCheckGraded, defaultCheckDetail = graded, why
-			if graded && !ok {
-				defaultCheckFail = why
-				log.Errorf("[Recovery]: default recovery assertion FAILED post-revert (%s)", why)
-			}
+	// Explicit probes keep upstream semantics: the PostChaos phase runs after the fault
+	// has reverted (EOT/Edge probes, and the end of Continuous ones), and a failing
+	// probe fails the run.
+	if chaosDetails.EngineName != "" && len(resultDetails.ProbeDetails) != 0 {
+		if err := probe.RunProbes(ctx, &chaosDetails, cs, &resultDetails, "PostChaos", &eventsDetails); err != nil {
+			log.Errorf("Probes Failed, err: %v", err)
+			result.RecordAfterFailure(&chaosDetails, &resultDetails, err, cs, &eventsDetails)
+			return
 		}
-	}
-
-	if probeErr != nil {
-		log.Errorf("Probes Failed, err: %v", probeErr)
-		result.RecordAfterFailure(&chaosDetails, &resultDetails, probeErr, cs, &eventsDetails)
-		return
-	}
-	switch {
-	case hasExplicitProbes:
-		// Explicit probes already graded this run; probeErr above is their verdict.
-		result.MarkGraded(&resultDetails, true, "recovery probe(s) passed -- target restored")
-	case defaultCheckFail != "":
-		// The built-in recovery assertion says the agent did not restore the target.
-		log.Errorf("[Recovery]: marking experiment Failed -- %s", defaultCheckFail)
-		result.MarkGraded(&resultDetails, false, defaultCheckFail)
-	case defaultCheckGraded:
-		result.MarkGraded(&resultDetails, true, defaultCheckDetail)
-	default:
-		// Nothing could judge the agent's remediation. Reported as N/A and dropped from
-		// the resiliency-score denominator -- never as a free Pass.
-		log.Warnf("[Recovery]: marking experiment N/A -- %s", defaultCheckDetail)
-		result.MarkUngraded(&resultDetails, defaultCheckDetail)
 	}
 
 	log.Infof("[The End]: Updating the chaos result of %v experiment (EOT)", chaosDetails.ExperimentName)

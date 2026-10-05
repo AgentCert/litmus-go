@@ -103,3 +103,25 @@ func TestMergeContainerMapFields_CreatesMissingAncestors(t *testing.T) {
 		t.Fatal("revert left the resources object behind; the target no longer matches its pre-chaos spec")
 	}
 }
+
+// bookinfo's Deployment details-v1 runs a single container named "details": the
+// workload-name convention does not hold, but the target is unambiguous.
+func TestSoleContainerFallback(t *testing.T) {
+	single := deployWithContainer("details", "book-info", map[string]interface{}{"image": "details:1"})
+	single.SetName("details-v1")
+	if _, err := ContainerIndex(single, TargetContainerName(single.GetName())); err == nil {
+		t.Fatal("precondition: details-v1 must not have a container named after it")
+	}
+	idx, name, ok := soleContainer(single)
+	if !ok || idx != 0 || name != "details" {
+		t.Fatalf("soleContainer = (%d, %q, %v), want (0, details, true)", idx, name, ok)
+	}
+
+	multi := deployWithContainer("app", "ns", map[string]interface{}{"image": "a"})
+	containers, _, _ := unstructured.NestedSlice(multi.Object, "spec", "template", "spec", "containers")
+	containers = append(containers, map[string]interface{}{"name": "sidecar", "image": "b"})
+	_ = unstructured.SetNestedSlice(multi.Object, containers, "spec", "template", "spec", "containers")
+	if _, _, ok := soleContainer(multi); ok {
+		t.Fatal("a multi-container workload must not be resolved by guessing")
+	}
+}
