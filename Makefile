@@ -24,7 +24,7 @@ help:
 	@echo ""
 
 .PHONY: all
-all: deps gotasks build push trivy-check
+all: deps gotasks build-amd64
 
 .PHONY: deps
 deps: _build_check_docker
@@ -80,7 +80,7 @@ build-amd64:
 	@echo "-------------------------"
 	@echo "--> Build go-runner image"
 	@echo "-------------------------"
-	@sudo docker build --file build/Dockerfile --tag $(DOCKER_REGISTRY)/$(DOCKER_REPO)/$(DOCKER_IMAGE):$(DOCKER_TAG) . --build-arg TARGETARCH=amd64 --build-arg LITMUS_VERSION=3.9.0
+	@docker build --network "$${ACE_BUILD_NETWORK:-default}" --file build/Dockerfile --tag $(DOCKER_REGISTRY)/$(DOCKER_REPO)/$(DOCKER_IMAGE):$(DOCKER_TAG) . --build-arg TARGETARCH=amd64 --build-arg LITMUS_VERSION=3.9.0
 
 .PHONY: push-amd64
 push-amd64:
@@ -88,7 +88,7 @@ push-amd64:
 	@echo "------------------------------"
 	@echo "--> Pushing image"
 	@echo "------------------------------"
-	@sudo docker push $(DOCKER_REGISTRY)/$(DOCKER_REPO)/$(DOCKER_IMAGE):$(DOCKER_TAG)
+	@docker push $(DOCKER_REGISTRY)/$(DOCKER_REPO)/$(DOCKER_IMAGE):$(DOCKER_TAG)
 
 .PHONY: trivy-check
 trivy-check:

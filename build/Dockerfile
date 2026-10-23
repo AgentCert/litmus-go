@@ -1,6 +1,12 @@
 # Multi-stage docker build
 # Build stage
-FROM golang:1.22 AS builder
+# Base images are ARGs (defaulting to the values previously hardcoded here) so
+# a restricted-network or private-registry build can point them at mirrored
+# copies, the same way build/Dockerfile.itbench does. Defaults keep the
+# unqualified `docker build` behaviour byte-identical.
+ARG GOLANG_IMAGE=golang:1.22
+ARG UBI_IMAGE=registry.access.redhat.com/ubi9/ubi:9.4
+FROM ${GOLANG_IMAGE} AS builder
 
 ARG TARGETOS=linux
 ARG TARGETARCH
@@ -15,7 +21,7 @@ RUN CGO_ENABLED=0 go build -o /output/experiments ./bin/experiment
 RUN CGO_ENABLED=0 go build -o /output/helpers ./bin/helper
 
 # Packaging stage
-FROM registry.access.redhat.com/ubi9/ubi:9.4
+FROM ${UBI_IMAGE}
 
 LABEL maintainer="LitmusChaos"
 
