@@ -72,6 +72,13 @@ func TestValidateRange(t *testing.T) {
 			t.Fatalf("range value %d outside [5,10]", n)
 		}
 	}
+	// a reversed range is read as the same range instead of panicking
+	for i := 0; i < 20; i++ {
+		n, err := strconv.Atoi(ValidateRange("10-5"))
+		if err != nil || n < 5 || n > 10 {
+			t.Fatalf("reversed range produced %d, %v", n, err)
+		}
+	}
 }
 
 func TestSubStringExistsInSlice(t *testing.T) {

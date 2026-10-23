@@ -206,6 +206,10 @@ func ValidateRange(a string) string {
 	case 2:
 		lb, _ = strconv.Atoi(intervals[0])
 		ub, _ = strconv.Atoi(intervals[1])
+		// A reversed range ("100-50") would make rand.Intn panic.
+		if lb > ub {
+			lb, ub = ub, lb
+		}
 		return strconv.Itoa(getRandomValue(lb, ub))
 	default:
 		log.Errorf("unable to parse the value, please provide in valid format")
