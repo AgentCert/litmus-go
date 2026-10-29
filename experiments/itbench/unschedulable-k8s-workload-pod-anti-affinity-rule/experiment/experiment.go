@@ -1,4 +1,4 @@
-// Package experiment implements unschedulable-kubernetes-workload-pod-anti-affinity-rule:
+// Package experiment implements unschedulable-k8s-workload-pod-anti-affinity-rule:
 // sets an unsatisfiable required podAntiAffinity rule against the workload's own label
 // (or ANTI_AFFINITY_LABEL if set) on TOPOLOGY_KEY, holds, restores.
 package experiment

@@ -16,16 +16,16 @@ import (
 
 	scaledToZero "github.com/litmuschaos/litmus-go/experiments/itbench/scaled-to-zero-kubernetes-workload/experiment"
 	invalidCommand "github.com/litmuschaos/litmus-go/experiments/itbench/invalid-kubernetes-workload-container-command/experiment"
-	modifiedEnvVar "github.com/litmuschaos/litmus-go/experiments/itbench/modified-kubernetes-workload-container-environment-variable/experiment"
+	modifiedEnvVar "github.com/litmuschaos/litmus-go/experiments/itbench/modified-k8s-workload-container-environment-variable/experiment"
 	nonexistentImage "github.com/litmuschaos/litmus-go/experiments/itbench/nonexistent-kubernetes-workload-container-image/experiment"
-	unsupportedArchImage "github.com/litmuschaos/litmus-go/experiments/itbench/unsupported-architecture-kubernetes-workload-container-image/experiment"
+	unsupportedArchImage "github.com/litmuschaos/litmus-go/experiments/itbench/unsupported-architecture-k8s-workload-container-image/experiment"
 	insufficientResources "github.com/litmuschaos/litmus-go/experiments/itbench/insufficient-kubernetes-workload-container-resources/experiment"
-	readinessProbe "github.com/litmuschaos/litmus-go/experiments/itbench/misconfigured-kubernetes-workload-container-readiness-probe/experiment"
-	unassignedLimits "github.com/litmuschaos/litmus-go/experiments/itbench/unassigned-kubernetes-workload-container-resource-limits/experiment"
+	readinessProbe "github.com/litmuschaos/litmus-go/experiments/itbench/misconfigured-k8s-workload-container-readiness-probe/experiment"
+	unassignedLimits "github.com/litmuschaos/litmus-go/experiments/itbench/unassigned-k8s-workload-container-resource-limits/experiment"
 	valkeyOOM "github.com/litmuschaos/litmus-go/experiments/itbench/valkey-workload-out-of-memory/experiment"
 	dnsPolicy "github.com/litmuschaos/litmus-go/experiments/itbench/failing-name-resolution-kubernetes-workload-dns-policy/experiment"
 	nonexistentNode "github.com/litmuschaos/litmus-go/experiments/itbench/nonexistent-kubernetes-workload-node/experiment"
-	antiAffinity "github.com/litmuschaos/litmus-go/experiments/itbench/unschedulable-kubernetes-workload-pod-anti-affinity-rule/experiment"
+	antiAffinity "github.com/litmuschaos/litmus-go/experiments/itbench/unschedulable-k8s-workload-pod-anti-affinity-rule/experiment"
 	serviceSelector "github.com/litmuschaos/litmus-go/experiments/itbench/invalid-kubernetes-service-selector/experiment"
 	targetPort "github.com/litmuschaos/litmus-go/experiments/itbench/modified-target-port-kubernetes-service/experiment"
 	hpaMisconfig "github.com/litmuschaos/litmus-go/experiments/itbench/misconfigured-kubernetes-horizontal-pod-autoscaler/experiment"
@@ -69,17 +69,17 @@ func main() {
 		scaledToZero.Run(ctx, cs)
 	case "invalid-kubernetes-workload-container-command":
 		invalidCommand.Run(ctx, cs)
-	case "modified-kubernetes-workload-container-environment-variable":
+	case "modified-k8s-workload-container-environment-variable":
 		modifiedEnvVar.Run(ctx, cs)
 	case "nonexistent-kubernetes-workload-container-image":
 		nonexistentImage.Run(ctx, cs)
-	case "unsupported-architecture-kubernetes-workload-container-image":
+	case "unsupported-architecture-k8s-workload-container-image":
 		unsupportedArchImage.Run(ctx, cs)
 	case "insufficient-kubernetes-workload-container-resources":
 		insufficientResources.Run(ctx, cs)
-	case "misconfigured-kubernetes-workload-container-readiness-probe":
+	case "misconfigured-k8s-workload-container-readiness-probe":
 		readinessProbe.Run(ctx, cs)
-	case "unassigned-kubernetes-workload-container-resource-limits":
+	case "unassigned-k8s-workload-container-resource-limits":
 		unassignedLimits.Run(ctx, cs)
 	case "valkey-workload-out-of-memory":
 		valkeyOOM.Run(ctx, cs)
@@ -87,7 +87,7 @@ func main() {
 		dnsPolicy.Run(ctx, cs)
 	case "nonexistent-kubernetes-workload-node":
 		nonexistentNode.Run(ctx, cs)
-	case "unschedulable-kubernetes-workload-pod-anti-affinity-rule":
+	case "unschedulable-k8s-workload-pod-anti-affinity-rule":
 		antiAffinity.Run(ctx, cs)
 	case "invalid-kubernetes-service-selector":
 		serviceSelector.Run(ctx, cs)

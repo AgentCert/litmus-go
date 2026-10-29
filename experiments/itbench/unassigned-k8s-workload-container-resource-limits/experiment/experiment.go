@@ -1,4 +1,4 @@
-// Package experiment implements unassigned-kubernetes-workload-container-resource-limits:
+// Package experiment implements unassigned-k8s-workload-container-resource-limits:
 // removes the target container's resources.limits entirely (no ceiling on cpu/memory
 // consumption), holds, restores.
 package experiment

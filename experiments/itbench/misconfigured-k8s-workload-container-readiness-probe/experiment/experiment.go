@@ -1,4 +1,4 @@
-// Package experiment implements misconfigured-kubernetes-workload-container-readiness-probe:
+// Package experiment implements misconfigured-k8s-workload-container-readiness-probe:
 // sets the target container's readinessProbe to an unreachable httpGet (PROBE_PATH,
 // PROBE_PORT), holds, restores.
 package experiment

@@ -1,4 +1,4 @@
-// Package experiment implements unsupported-architecture-kubernetes-workload-container-image:
+// Package experiment implements unsupported-architecture-k8s-workload-container-image:
 // sets the target container's image to one published for an unsupported architecture
 // (INVALID_ARCH_IMAGE, e.g. an arm64-only image on an amd64 node), holds, restores.
 package experiment

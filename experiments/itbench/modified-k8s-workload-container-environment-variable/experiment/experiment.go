@@ -1,4 +1,4 @@
-// Package experiment implements modified-kubernetes-workload-container-environment-variable:
+// Package experiment implements modified-k8s-workload-container-environment-variable:
 // overwrites (or adds) one named env var on the target container (ENV_VAR_NAME,
 // BAD_ENV_VALUE), holds, then restores the original value -- or removes the var entirely
 // if it did not exist beforehand. Env vars are matched by name within a list, not a fixed
