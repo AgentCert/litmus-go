@@ -7,44 +7,47 @@ package main
 import (
 	"context"
 	"flag"
+	itbench "github.com/litmuschaos/litmus-go/pkg/itbench/common"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/litmuschaos/litmus-go/pkg/clients"
 	"github.com/litmuschaos/litmus-go/pkg/log"
 
-	scaledToZero "github.com/litmuschaos/litmus-go/experiments/itbench/scaled-to-zero-kubernetes-workload/experiment"
-	invalidCommand "github.com/litmuschaos/litmus-go/experiments/itbench/invalid-kubernetes-workload-container-command/experiment"
-	modifiedEnvVar "github.com/litmuschaos/litmus-go/experiments/itbench/modified-k8s-workload-container-environment-variable/experiment"
-	nonexistentImage "github.com/litmuschaos/litmus-go/experiments/itbench/nonexistent-kubernetes-workload-container-image/experiment"
-	unsupportedArchImage "github.com/litmuschaos/litmus-go/experiments/itbench/unsupported-architecture-k8s-workload-container-image/experiment"
-	insufficientResources "github.com/litmuschaos/litmus-go/experiments/itbench/insufficient-kubernetes-workload-container-resources/experiment"
-	readinessProbe "github.com/litmuschaos/litmus-go/experiments/itbench/misconfigured-k8s-workload-container-readiness-probe/experiment"
-	unassignedLimits "github.com/litmuschaos/litmus-go/experiments/itbench/unassigned-k8s-workload-container-resource-limits/experiment"
-	valkeyOOM "github.com/litmuschaos/litmus-go/experiments/itbench/valkey-workload-out-of-memory/experiment"
-	dnsPolicy "github.com/litmuschaos/litmus-go/experiments/itbench/failing-name-resolution-kubernetes-workload-dns-policy/experiment"
-	nonexistentNode "github.com/litmuschaos/litmus-go/experiments/itbench/nonexistent-kubernetes-workload-node/experiment"
-	antiAffinity "github.com/litmuschaos/litmus-go/experiments/itbench/unschedulable-k8s-workload-pod-anti-affinity-rule/experiment"
-	serviceSelector "github.com/litmuschaos/litmus-go/experiments/itbench/invalid-kubernetes-service-selector/experiment"
-	targetPort "github.com/litmuschaos/litmus-go/experiments/itbench/modified-target-port-kubernetes-service/experiment"
-	hpaMisconfig "github.com/litmuschaos/litmus-go/experiments/itbench/misconfigured-kubernetes-horizontal-pod-autoscaler/experiment"
-	resourceQuota "github.com/litmuschaos/litmus-go/experiments/itbench/insufficient-kubernetes-resource-quota/experiment"
-	crashingInit "github.com/litmuschaos/litmus-go/experiments/itbench/crashing-kubernetes-workload-init-container/experiment"
-	hangingInit "github.com/litmuschaos/litmus-go/experiments/itbench/hanging-kubernetes-workload-init-container/experiment"
-	cordonNode "github.com/litmuschaos/litmus-go/experiments/itbench/cordoned-kubernetes-worker-node/experiment"
-	deletedService "github.com/litmuschaos/litmus-go/experiments/itbench/deleted-kubernetes-service/experiment"
-	valkeyPassword "github.com/litmuschaos/litmus-go/experiments/itbench/valkey-workload-changed-password/experiment"
 	httpAbort "github.com/litmuschaos/litmus-go/experiments/itbench/chaos-mesh-http-abort-replacement/experiment"
+	httpBodyTamper "github.com/litmuschaos/litmus-go/experiments/itbench/chaos-mesh-http-body-tamper-replacement/experiment"
+	podFailure "github.com/litmuschaos/litmus-go/experiments/itbench/chaos-mesh-pod-failure-replacement/experiment"
+	cordonNode "github.com/litmuschaos/litmus-go/experiments/itbench/cordoned-kubernetes-worker-node/experiment"
+	crashingInit "github.com/litmuschaos/litmus-go/experiments/itbench/crashing-kubernetes-workload-init-container/experiment"
+	deletedService "github.com/litmuschaos/litmus-go/experiments/itbench/deleted-kubernetes-service/experiment"
+	dnsPolicy "github.com/litmuschaos/litmus-go/experiments/itbench/failing-name-resolution-kubernetes-workload-dns-policy/experiment"
+	hangingInit "github.com/litmuschaos/litmus-go/experiments/itbench/hanging-kubernetes-workload-init-container/experiment"
 	ingressBlock "github.com/litmuschaos/litmus-go/experiments/itbench/ingress-port-blocking-network-policy/experiment"
+	resourceQuota "github.com/litmuschaos/litmus-go/experiments/itbench/insufficient-kubernetes-resource-quota/experiment"
+	insufficientResources "github.com/litmuschaos/litmus-go/experiments/itbench/insufficient-kubernetes-workload-container-resources/experiment"
+	serviceSelector "github.com/litmuschaos/litmus-go/experiments/itbench/invalid-kubernetes-service-selector/experiment"
+	invalidCommand "github.com/litmuschaos/litmus-go/experiments/itbench/invalid-kubernetes-workload-container-command/experiment"
+	apiServerSurge "github.com/litmuschaos/litmus-go/experiments/itbench/kubernetes-api-server-request-surge/experiment"
+	readinessProbe "github.com/litmuschaos/litmus-go/experiments/itbench/misconfigured-k8s-workload-container-readiness-probe/experiment"
+	hpaMisconfig "github.com/litmuschaos/litmus-go/experiments/itbench/misconfigured-kubernetes-horizontal-pod-autoscaler/experiment"
+	modifiedEnvVar "github.com/litmuschaos/litmus-go/experiments/itbench/modified-k8s-workload-container-environment-variable/experiment"
+	targetPort "github.com/litmuschaos/litmus-go/experiments/itbench/modified-target-port-kubernetes-service/experiment"
+	nonexistentImage "github.com/litmuschaos/litmus-go/experiments/itbench/nonexistent-kubernetes-workload-container-image/experiment"
+	nonexistentNode "github.com/litmuschaos/litmus-go/experiments/itbench/nonexistent-kubernetes-workload-node/experiment"
 	nonexistentPVC "github.com/litmuschaos/litmus-go/experiments/itbench/nonexistent-kubernetes-workload-persistent-volume-claim/experiment"
 	featureFlag "github.com/litmuschaos/litmus-go/experiments/itbench/opentelemetry-demo-feature-flag/experiment"
-	httpBodyTamper "github.com/litmuschaos/litmus-go/experiments/itbench/chaos-mesh-http-body-tamper-replacement/experiment"
-	apiServerSurge "github.com/litmuschaos/litmus-go/experiments/itbench/kubernetes-api-server-request-surge/experiment"
 	priorityPreemption "github.com/litmuschaos/litmus-go/experiments/itbench/priority-kubernetes-workload-priority-preemption/experiment"
-	podFailure "github.com/litmuschaos/litmus-go/experiments/itbench/chaos-mesh-pod-failure-replacement/experiment"
+	scaledToZero "github.com/litmuschaos/litmus-go/experiments/itbench/scaled-to-zero-kubernetes-workload/experiment"
+	unassignedLimits "github.com/litmuschaos/litmus-go/experiments/itbench/unassigned-k8s-workload-container-resource-limits/experiment"
 	uninstallAgent "github.com/litmuschaos/litmus-go/experiments/itbench/uninstall-agent/experiment"
 	uninstallApplication "github.com/litmuschaos/litmus-go/experiments/itbench/uninstall-application/experiment"
+	antiAffinity "github.com/litmuschaos/litmus-go/experiments/itbench/unschedulable-k8s-workload-pod-anti-affinity-rule/experiment"
+	unsupportedArchImage "github.com/litmuschaos/litmus-go/experiments/itbench/unsupported-architecture-k8s-workload-container-image/experiment"
+	valkeyPassword "github.com/litmuschaos/litmus-go/experiments/itbench/valkey-workload-changed-password/experiment"
+	valkeyOOM "github.com/litmuschaos/litmus-go/experiments/itbench/valkey-workload-out-of-memory/experiment"
 )
 
 func main() {
@@ -53,6 +56,9 @@ func main() {
 	// experimentName must be registered before GenerateClientSetFromKubeConfig(), which
 	// itself registers -kubeconfig and calls flag.Parse() -- matching bin/experiment's
 	// own ordering (see pkg/clients/clientset.go's getKubeConfig()).
+	freezeID := flag.String("freeze-container-id", "", "freeze an exact container cgroup from a hostPID helper")
+	freezeSeconds := flag.Int("freeze-seconds", 0, "independent thaw deadline")
+	apiLoad := flag.Bool("api-load", false, "run the bounded API load helper")
 	experimentName := flag.String("name", "", "name of the itbench chaos experiment")
 
 	if err := cs.GenerateClientSetFromKubeConfig(); err != nil {
@@ -63,6 +69,22 @@ func main() {
 	// so a workflow stop ends the run without leaving the target mutated.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if *freezeID != "" {
+		if err := itbench.RunFreeze(ctx, *freezeID, time.Duration(*freezeSeconds)*time.Second); err != nil {
+			log.Fatalf("container freeze failed: %v", err)
+		}
+		return
+	}
+	if *apiLoad {
+		rps, err := strconv.Atoi(os.Getenv("RPS"))
+		if err != nil {
+			log.Fatalf("invalid RPS: %v", err)
+		}
+		if err := itbench.RunAPILoad(ctx, cs.KubeConfig, os.Getenv("LOAD_NAMESPACE"), rps); err != nil {
+			log.Fatalf("API load helper failed: %v", err)
+		}
+		return
+	}
 
 	switch *experimentName {
 	case "scaled-to-zero-kubernetes-workload":

@@ -7,14 +7,15 @@ package experiment
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
 
 	"github.com/litmuschaos/litmus-go/pkg/clients"
-	"github.com/litmuschaos/litmus-go/pkg/log"
 	itbench "github.com/litmuschaos/litmus-go/pkg/itbench/common"
+	"github.com/litmuschaos/litmus-go/pkg/log"
 	"github.com/litmuschaos/litmus-go/pkg/types"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,14 +33,13 @@ func Run(ctx context.Context, cs clients.ClientSets) {
 	itbench.Run(ctx, cs, inject)
 }
 
-func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.ChaosDetails) error {
+func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.ChaosDetails) (retErr error) {
 	if len(chaosDetails.AppDetail) == 0 {
 		return fmt.Errorf("no target namespace resolved: TARGETS env var was empty/unset")
 	}
 	namespace := chaosDetails.AppDetail[0].Namespace
 
 	workloadName := os.Getenv("SURGE_WORKLOAD_NAME")
-	surgeImage := os.Getenv("SURGE_IMAGE")
 	// Discarding these parse errors would silently degrade a 1000 req/s surge to the
 	// rpsPerPod<1 clamp of 1 req/s -- not a detectable API-server surge, yet still Passed.
 	requestsPerSecond, err := strconv.Atoi(strings.TrimSpace(os.Getenv("REQUESTS_PER_SECOND")))
@@ -50,10 +50,21 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 	if err != nil || surgeReplicas <= 0 {
 		return fmt.Errorf("SURGE_REPLICAS must be a positive integer, got %q", os.Getenv("SURGE_REPLICAS"))
 	}
-	rpsPerPod := requestsPerSecond / surgeReplicas
-	if rpsPerPod < 1 {
-		rpsPerPod = 1
+	if surgeReplicas > requestsPerSecond || requestsPerSecond%surgeReplicas != 0 {
+		return fmt.Errorf("REQUESTS_PER_SECOND must divide evenly across SURGE_REPLICAS, with at least one request per helper")
 	}
+	rpsPerPod := requestsPerSecond / surgeReplicas
+	if rpsPerPod > 10000 {
+		return fmt.Errorf("load per helper exceeds 10000 requests/second")
+	}
+	if workloadName == "" {
+		return fmt.Errorf("SURGE_WORKLOAD_NAME is required")
+	}
+	self, err := itbench.ThisExperimentPod(ctx, cs)
+	if err != nil {
+		return err
+	}
+	surgeImage := helperImage(self)
 
 	labels := map[string]interface{}{"litmuschaos.io/fault": "kubernetes-api-server-request-surge"}
 
@@ -79,22 +90,6 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 		},
 	}}
 
-	loadScript := `set -eu
-echo "=== API Request Surge Load Generator ==="
-echo "Target: kube-apiserver (namespace ` + namespace + ` pods endpoint)"
-echo "Requests per second (this pod): ${RPS}"
-echo "Duration: ${DURATION}s"
-END=$(( $(date +%s) + ${DURATION} ))
-while [ "$(date +%s)" -lt "${END}" ]; do
-  i=0
-  while [ "${i}" -lt "${RPS}" ]; do
-    kubectl get --raw="/api/v1/namespaces/` + namespace + `/pods" >/dev/null 2>&1 &
-    i=$((i + 1))
-  done
-  wait
-done
-echo "load generation complete"
-`
 	deployment := &unstructured.Unstructured{Object: map[string]interface{}{
 		"apiVersion": "apps/v1", "kind": "Deployment",
 		"metadata": map[string]interface{}{
@@ -114,13 +109,13 @@ echo "load generation complete"
 							"image": surgeImage,
 							"env": []interface{}{
 								map[string]interface{}{"name": "RPS", "value": fmt.Sprintf("%d", rpsPerPod)},
-								map[string]interface{}{"name": "DURATION", "value": fmt.Sprintf("%d", chaosDetails.ChaosDuration)},
+								map[string]interface{}{"name": "LOAD_NAMESPACE", "value": namespace},
 							},
-							"command": []string{"/bin/sh", "-c"},
-							"args":    []string{loadScript},
+							"command": []interface{}{"/itbench-experiment"},
+							"args":    []interface{}{"-api-load"},
 							"resources": map[string]interface{}{
 								"requests": map[string]interface{}{"cpu": "50m", "memory": "64Mi"},
-								"limits":   map[string]interface{}{"cpu": "200m", "memory": "128Mi"},
+								"limits":   map[string]interface{}{"cpu": "1", "memory": "128Mi"},
 							},
 						},
 					},
@@ -129,7 +124,15 @@ echo "load generation complete"
 		},
 	}}
 
-	log.Infof("Injecting: deploying %s (%d replicas, ~%d req/s/pod, ~%d req/s aggregate target) into %s", workloadName, surgeReplicas, rpsPerPod, requestsPerSecond, namespace)
+	// The helpers are created after the server resolved the manifest's images, so
+	// they inherit this experiment's registry credentials rather than going without.
+	// The pod spec is mutated in place: unstructured.NestedMap deep-copies, which
+	// panics on any value that is not already JSON-shaped.
+	if podSpec := itbench.NestedObject(deployment.Object, "spec", "template", "spec"); podSpec != nil {
+		self.ApplyTo(podSpec, surgeImage)
+	}
+
+	log.Infof("Injecting: deploying %s (%d replicas, ~%d req/s/pod, ~%d req/s aggregate target) using image %s into %s", workloadName, surgeReplicas, rpsPerPod, requestsPerSecond, surgeImage, namespace)
 	saClient := cs.DynamicClient.Resource(gvrServiceAccounts).Namespace(namespace)
 	roleClient := cs.DynamicClient.Resource(gvrRoles).Namespace(namespace)
 	rbClient := cs.DynamicClient.Resource(gvrRoleBindings).Namespace(namespace)
@@ -138,13 +141,13 @@ echo "load generation complete"
 	// Each object is registered for deletion the moment it exists: all four share one fixed
 	// name, so anything left behind by a partial create or an abort makes every later run
 	// fail with AlreadyExists.
-	var cleanups []func(ctx context.Context)
+	var cleanups []func(ctx context.Context) error
 	defer func() {
 		revertCtx, cancel := itbench.RevertContext()
 		defer cancel()
 		log.Infof("Reverting: deleting %s surge workload and its RBAC from %s", workloadName, namespace)
 		for i := len(cleanups) - 1; i >= 0; i-- {
-			cleanups[i](revertCtx)
+			retErr = errors.Join(retErr, cleanups[i](revertCtx))
 		}
 	}()
 
@@ -152,7 +155,9 @@ echo "load generation complete"
 		if _, err := rc.Create(ctx, obj, metav1.CreateOptions{}); err != nil {
 			return fmt.Errorf("creating %s: %w", kind, err)
 		}
-		cleanups = append(cleanups, func(c context.Context) { deleteIgnoreNotFound(c, rc, workloadName) })
+		kindGVR := map[string]schema.GroupVersionResource{"serviceaccount": gvrServiceAccounts, "role": gvrRoles, "rolebinding": gvrRoleBindings, "surge deployment": itbench.GVRDeployments}[kind]
+		itbench.TrackTemporaryResource(ctx, kindGVR, namespace, workloadName)
+		cleanups = append(cleanups, func(c context.Context) error { return deleteIgnoreNotFound(c, rc, workloadName) })
 		return nil
 	}
 
@@ -178,10 +183,25 @@ type namespacedClient interface {
 	Delete(ctx context.Context, name string, opts metav1.DeleteOptions, subresources ...string) error
 }
 
+// helperImage resolves the image the load generators must run. The generator is
+// this same binary invoked with -api-load, so the image has to be the experiment's
+// own: SURGE_IMAGE used to name a general-purpose kubectl image left over from the
+// original shell-script generator, which has no /itbench-experiment to execute, so
+// every helper pod failed to start and the surge delivered no load at all.
+// Inheriting it from the running pod keeps the helper on the same build and the
+// same registry as the experiment, whichever registry that is.
+func helperImage(self itbench.ExperimentPod) string {
+	if configured := strings.TrimSpace(os.Getenv("SURGE_IMAGE")); configured != "" {
+		return configured
+	}
+	return self.Image
+}
+
 func deleteIgnoreNotFound(ctx context.Context, rc interface {
 	Delete(ctx context.Context, name string, opts metav1.DeleteOptions, subresources ...string) error
-}, name string) {
+}, name string) error {
 	if err := rc.Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !k8serrors.IsNotFound(err) {
-		log.Errorf("failed to delete %s (non-fatal): %v", name, err)
+		return fmt.Errorf("deleting %s: %w", name, err)
 	}
+	return nil
 }

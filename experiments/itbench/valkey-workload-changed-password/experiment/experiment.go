@@ -11,8 +11,8 @@ import (
 	"os"
 
 	"github.com/litmuschaos/litmus-go/pkg/clients"
-	"github.com/litmuschaos/litmus-go/pkg/log"
 	itbench "github.com/litmuschaos/litmus-go/pkg/itbench/common"
+	"github.com/litmuschaos/litmus-go/pkg/log"
 	"github.com/litmuschaos/litmus-go/pkg/types"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -42,8 +42,9 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 		return getErr
 	}
 	var origSecretValue string
+	var secretKeyExisted bool
 	if secretExisted {
-		origSecretValue, _, _ = unstructured.NestedString(existingSecret.Object, "data", secretKey)
+		origSecretValue, secretKeyExisted, _ = unstructured.NestedString(existingSecret.Object, "data", secretKey)
 		log.Infof("Injecting: setting %s/%s to an invalid password", secretName, secretKey)
 		if err := unstructured.SetNestedField(existingSecret.Object, faultPassword, "stringData", secretKey); err != nil {
 			return err
@@ -71,7 +72,7 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 	defer func() {
 		revertCtx, cancel := itbench.RevertContext()
 		defer cancel()
-		if err := revertSecret(revertCtx, secretClient, secretName, secretKey, origSecretValue, secretExisted); err != nil {
+		if err := revertSecret(revertCtx, secretClient, secretName, secretKey, origSecretValue, secretExisted, secretKeyExisted); err != nil {
 			log.Errorf("failed to restore Secret %s -- valkey stays broken: %v", secretName, err)
 			if retErr == nil {
 				retErr = err
@@ -86,14 +87,28 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 			"secretKeyRef": map[string]interface{}{"name": secretName, "key": secretKey},
 		},
 	}
+	target, index, _, err := itbench.ResolveTargetWorkloadAndContainer(ctx, cs, chaosDetails)
+	if err != nil {
+		return err
+	}
+	containers, _, _ := unstructured.NestedSlice(target.Object, "spec", "template", "spec", "containers")
+	envs, _, _ := unstructured.NestedSlice(containers[index].(map[string]interface{}), "env")
+	filtered := make([]interface{}, 0, len(envs)+1)
+	for _, entry := range envs {
+		value, ok := entry.(map[string]interface{})
+		if ok && value["name"] != "VALKEY_PASSWORD" {
+			filtered = append(filtered, entry)
+		}
+	}
+	filtered = append(filtered, envVar)
 	return itbench.PatchContainerFields(ctx, cs, chaosDetails, []itbench.ContainerFieldSpec{
 		{Path: []string{"command"}, NewValue: []string{"valkey-server"}},
 		{Path: []string{"args"}, NewValue: []string{"--requirepass", "$(VALKEY_PASSWORD)"}},
-		{Path: []string{"env"}, NewValue: []interface{}{envVar}},
+		{Path: []string{"env"}, NewValue: filtered},
 	})
 }
 
-func revertSecret(ctx context.Context, secretClient dynamic.ResourceInterface, secretName, secretKey, origValue string, existed bool) error {
+func revertSecret(ctx context.Context, secretClient dynamic.ResourceInterface, secretName, secretKey, origValue string, existed, keyExisted bool) error {
 	if !existed {
 		log.Infof("Reverting: deleting Secret %s (did not exist before injection)", secretName)
 		if err := secretClient.Delete(ctx, secretName, metav1.DeleteOptions{}); err != nil && !k8serrors.IsNotFound(err) {
@@ -109,8 +124,12 @@ func revertSecret(ctx context.Context, secretClient dynamic.ResourceInterface, s
 	// stringData is write-only and is what injection set; clearing it lets the restored
 	// base64 data value take effect again.
 	unstructured.RemoveNestedField(current.Object, "stringData", secretKey)
-	if err := unstructured.SetNestedField(current.Object, origValue, "data", secretKey); err != nil {
-		return err
+	if keyExisted {
+		if err := unstructured.SetNestedField(current.Object, origValue, "data", secretKey); err != nil {
+			return err
+		}
+	} else {
+		unstructured.RemoveNestedField(current.Object, "data", secretKey)
 	}
 	_, err = secretClient.Update(ctx, current, metav1.UpdateOptions{})
 	return err

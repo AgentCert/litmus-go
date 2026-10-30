@@ -9,11 +9,10 @@ package common
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/litmuschaos/chaos-operator/api/litmuschaos/v1alpha1"
@@ -27,8 +26,8 @@ import (
 	"github.com/litmuschaos/litmus-go/pkg/types"
 	litmusCommon "github.com/litmuschaos/litmus-go/pkg/utils/common"
 	"github.com/sirupsen/logrus"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	ktypes "k8s.io/apimachinery/pkg/types"
@@ -38,64 +37,25 @@ import (
 // state, patch, hold for chaosDetails.ChaosDuration, revert) and returns nil on success.
 type InjectFunc func(ctx context.Context, cs clients.ClientSets, chaosDetails *types.ChaosDetails) error
 
-// midChaosHook, when set, is invoked by HoldChaos (called from every itbench patch
-// helper's hold-then-revert point in fieldpatch.go/containerpatch.go) at the instant the
-// fault has been held for its full ChaosDuration but BEFORE the helper reverts it -- the
-// last moment the injected fault is still live.
-//
-// Run() uses it to log the target's state at that instant (see defaultRecoveryAssertion).
-// That is a record only: like the upstream generic faults, an itbench verdict says
-// whether the fault injected and reverted cleanly, never what the agent under test did.
-// The agent is judged by the certifier from its own trace.
-var (
-	midChaosHook   func(ctx context.Context)
-	midChaosHookMu sync.Mutex
-)
-
-// setMidChaosHook installs (or, passed nil, clears) the mid-chaos probe hook. Guarded by
-// a mutex only for safety against concurrent Run() calls in the same process (the
-// itbench-experiment binary only ever runs one at a time in practice, via -name).
-func setMidChaosHook(fn func(ctx context.Context)) {
-	midChaosHookMu.Lock()
-	midChaosHook = fn
-	midChaosHookMu.Unlock()
-}
-
-// RunMidChaosHook invokes the currently-installed mid-chaos hook, if any. It is a no-op
-// (and therefore safe to call unconditionally) when Run() has no probes to evaluate --
-// setMidChaosHook is only ever called when resultDetails.ProbeDetails is non-empty.
-func RunMidChaosHook(ctx context.Context) {
-	midChaosHookMu.Lock()
-	fn := midChaosHook
-	midChaosHookMu.Unlock()
-	if fn != nil {
-		fn(ctx)
-	}
-}
-
-// HoldChaos blocks for the fault's ChaosDuration (honoring ctx cancellation, same as
-// Sleep) and then runs the mid-chaos hook. Every itbench patch helper calls this in place
-// of a bare Sleep(ctx, chaosDetails.ChaosDuration) at its hold-then-revert point, so the
-// helper's own revert logic (unchanged) always still runs immediately afterward -- a
-// probe failure here never leaves the target un-reverted.
-func HoldChaos(ctx context.Context, chaosDetails *types.ChaosDetails) {
-	Sleep(ctx, chaosDetails.ChaosDuration)
-	if ctx.Err() != nil {
-		// Aborted mid-hold: skip the end-of-window observation (the window never ended)
-		// and fall straight through to the caller's revert, which runs on RevertContext
-		// and therefore still works.
-		log.Info("[Abort]: hold interrupted -- skipping the end-of-window observation and reverting the fault now")
+// HoldChaos verifies the initial effect, waits for the configured window, and
+// returns to the injector's rollback. Agent remediation during the window is allowed.
+func HoldChaos(ctx context.Context, details *types.ChaosDetails) {
+	if v := verification(ctx); v != nil {
+		v.hold(ctx)
 		return
 	}
-	RunMidChaosHook(ctx)
+	Sleep(ctx, details.ChaosDuration)
 }
 
 // RevertTimeout bounds each fault's post-hold revert.
 var RevertTimeout = 90 * time.Second
 
 // abortRevertGrace is how long the abort watcher lets an in-flight revert finish before
-// force-exiting. Must exceed RevertTimeout so a revert that is merely slow is not killed.
-var abortRevertGrace = RevertTimeout + 30*time.Second
+// force-exiting. It must exceed the revert itself plus the recovery verification that
+// follows it, so a run that is merely waiting for a rollout is not killed mid-flight.
+func abortRevertGrace(details *types.ChaosDetails) time.Duration {
+	return RevertTimeout + RecoveryBudget(details) + 30*time.Second
+}
 
 // RevertContext returns the context a fault's post-hold revert must use instead of the
 // experiment's own ctx. On SIGTERM the experiment ctx is cancelled, which would make every
@@ -103,139 +63,6 @@ var abortRevertGrace = RevertTimeout + 30*time.Second
 // a workflow stop would break the cluster rather than just ending the run.
 func RevertContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), RevertTimeout)
-}
-
-// defaultRecoveryAssertion reports whether the SDK-resolved target
-// (chaosDetails.AppDetail[0]) looks restored at the end of the fault hold, before the
-// fault reverts it. Run() only logs the result as a record of the target's state; it
-// never decides the verdict.
-//
-//   - deployment/statefulset : status.readyReplicas >= 1
-//   - pod                    : at least one matching pod is Ready
-//   - service                : the Service's Endpoints has >= 1 ready address
-//   - horizontalpodautoscaler: spec targets no longer match the injected values
-//   - any other kind         : not checked -- can't generically tell
-//
-// graded=false means nothing could be checked (check disabled, no target resolved,
-// unsupported kind, or the lookup itself failed); ok is meaningless then. Teardown
-// experiments (uninstall-*) are not checked either. Gated by
-// ITBENCH_DEFAULT_RECOVERY_CHECK (default on; "false"/"0"/"no" disables).
-func defaultRecoveryAssertion(ctx context.Context, cs clients.ClientSets, chaosDetails *types.ChaosDetails) (graded, ok bool, detail string) {
-	switch v := strings.ToLower(strings.TrimSpace(os.Getenv("ITBENCH_DEFAULT_RECOVERY_CHECK"))); v {
-	case "false", "0", "no", "off":
-		return true, true, "recovery assertion disabled via ITBENCH_DEFAULT_RECOVERY_CHECK"
-	}
-	if strings.HasPrefix(strings.ToLower(chaosDetails.ExperimentName), "uninstall-") {
-		return true, true, "teardown experiment -- not graded on remediation"
-	}
-	if len(chaosDetails.AppDetail) == 0 {
-		return false, false, "no target resolved (TARGETS unset) -- nothing to assert"
-	}
-	app := chaosDetails.AppDetail[0]
-	switch strings.ToLower(app.Kind) {
-	case "deployment", "deployments", "statefulset", "statefulsets":
-		gvr, err := WorkloadGVRForKind(app.Kind)
-		if err != nil {
-			return false, false, "unknown workload kind: " + err.Error()
-		}
-		obj, err := ResolveTarget(ctx, cs, gvr, chaosDetails)
-		if err != nil {
-			return false, false, "could not resolve target workload: " + err.Error()
-		}
-		ready, _, _ := unstructured.NestedInt64(obj.Object, "status", "readyReplicas")
-		if ready >= 1 {
-			return true, true, fmt.Sprintf("%s/%s readyReplicas=%d -- target restored", gvr.Resource, obj.GetName(), ready)
-		}
-		return true, false, fmt.Sprintf("%s/%s still has readyReplicas=%d -- target not restored", gvr.Resource, obj.GetName(), ready)
-	case "pod", "pods":
-		pods, err := ResolveTargets(ctx, cs, GVRPods, chaosDetails)
-		if err != nil || len(pods) == 0 {
-			return false, false, "could not resolve target pods"
-		}
-		for _, p := range pods {
-			conds, _, _ := unstructured.NestedSlice(p.Object, "status", "conditions")
-			for _, c := range conds {
-				if m, _ := c.(map[string]interface{}); m["type"] == "Ready" && m["status"] == "True" {
-					return true, true, fmt.Sprintf("pod %s is Ready -- target restored", p.GetName())
-				}
-			}
-		}
-		return true, false, "no target pod is Ready -- target not restored"
-	case "service", "services":
-		svc, err := ResolveTarget(ctx, cs, GVRServices, chaosDetails)
-		if err != nil {
-			return true, false, "target Service not found -- not restored: " + err.Error()
-		}
-		epsGVR := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "endpoints"}
-		eps, err := cs.DynamicClient.Resource(epsGVR).Namespace(svc.GetNamespace()).Get(ctx, svc.GetName(), metav1.GetOptions{})
-		if err != nil {
-			return true, false, fmt.Sprintf("Service %s has no Endpoints object -- not restored", svc.GetName())
-		}
-		subsets, _, _ := unstructured.NestedSlice(eps.Object, "subsets")
-		for _, s := range subsets {
-			if m, _ := s.(map[string]interface{}); m != nil {
-				if addrs, ok := m["addresses"].([]interface{}); ok && len(addrs) > 0 {
-					return true, true, fmt.Sprintf("Service %s has %d ready endpoint address(es) -- target restored", svc.GetName(), len(addrs))
-				}
-			}
-		}
-		return true, false, fmt.Sprintf("Service %s has 0 ready endpoint addresses -- not restored", svc.GetName())
-	case "horizontalpodautoscaler", "horizontalpodautoscalers", "hpa":
-		return hpaRecoveryAssertion(ctx, cs, chaosDetails)
-	default:
-		return false, false, "no built-in recovery assertion for kind " + app.Kind
-	}
-}
-
-// hpaRecoveryAssertion grades misconfigured-kubernetes-horizontal-pod-autoscaler, whose
-// damage is a *configuration* value rather than an unready workload -- readyReplicas stays
-// healthy throughout, so the generic workload assertion would report a free pass.
-//
-// The fault sets the HPA's cpu/memory utilization targets to CPU_UTILIZATION_PERCENT /
-// MEMORY_UTILIZATION_PERCENT. The agent has remediated it when the live targets no longer
-// match those injected values. With neither env var set there is nothing to compare
-// against, so the run is ungraded rather than passed.
-func hpaRecoveryAssertion(ctx context.Context, cs clients.ClientSets, chaosDetails *types.ChaosDetails) (graded, ok bool, detail string) {
-	injected := map[string]string{}
-	for resourceName, envName := range map[string]string{
-		"cpu":    "CPU_UTILIZATION_PERCENT",
-		"memory": "MEMORY_UTILIZATION_PERCENT",
-	} {
-		if v := strings.TrimSpace(os.Getenv(envName)); v != "" {
-			injected[resourceName] = v
-		}
-	}
-	if len(injected) == 0 {
-		return false, false, "no injected HPA utilization values (CPU_/MEMORY_UTILIZATION_PERCENT unset) -- nothing to compare against"
-	}
-
-	obj, err := ResolveTarget(ctx, cs, GVRHPA, chaosDetails)
-	if err != nil {
-		return false, false, "could not resolve target HorizontalPodAutoscaler: " + err.Error()
-	}
-
-	metrics, _, _ := unstructured.NestedSlice(obj.Object, "spec", "metrics")
-	var stillInjected []string
-	for _, m := range metrics {
-		entry, _ := m.(map[string]interface{})
-		if entry == nil {
-			continue
-		}
-		resourceName, _, _ := unstructured.NestedString(entry, "resource", "name")
-		want, tracked := injected[strings.ToLower(resourceName)]
-		if !tracked {
-			continue
-		}
-		live, found, _ := unstructured.NestedInt64(entry, "resource", "target", "averageUtilization")
-		if found && strconv.FormatInt(live, 10) == want {
-			stillInjected = append(stillInjected, fmt.Sprintf("%s=%d", resourceName, live))
-		}
-	}
-	if len(stillInjected) > 0 {
-		return true, false, fmt.Sprintf("HPA %s still carries the injected utilization target(s) %s -- not remediated",
-			obj.GetName(), strings.Join(stillInjected, ", "))
-	}
-	return true, true, fmt.Sprintf("HPA %s no longer matches the injected utilization target(s) -- remediated", obj.GetName())
 }
 
 // recordAbort writes the "Stopped" ChaosResult and the abort events -- the same bookkeeping
@@ -271,11 +98,12 @@ func watchAbort(ctx context.Context, done <-chan struct{}, cs clients.ClientSets
 		return
 	}
 	log.Info("[Abort]: terminated signal received -- waiting for the fault to revert before exiting")
+	grace := abortRevertGrace(chaosDetails)
 	select {
 	case <-done:
-	case <-time.After(abortRevertGrace):
-		log.Errorf("[Abort]: revert did not finish within %s -- exiting anyway; the target may still be mutated", abortRevertGrace)
-		recordAbort(cs, resultDetails, chaosDetails, eventsDetails)
+	case <-time.After(grace):
+		log.Errorf("[Abort]: revert did not finish within %s -- exiting anyway; the target may still be mutated", grace)
+		result.RecordAfterFailure(chaosDetails, resultDetails, cerrors.Error{ErrorCode: cerrors.ErrorTypeChaosRevert, Reason: "abort cleanup exceeded its deadline; recovery was not verified"}, cs, eventsDetails)
 		os.Exit(1)
 	}
 }
@@ -346,32 +174,54 @@ func Run(ctx context.Context, cs clients.ClientSets, inject InjectFunc) {
 		}
 	}
 
-	// Record the target's state at the end of the fault window, just before the fault
-	// reverts itself (HoldChaos runs this hook from every itbench patch helper). It is
-	// logged only and never affects the verdict.
-	if chaosDetails.EngineName != "" {
-		setMidChaosHook(func(hookCtx context.Context) {
-			_, _, why := defaultRecoveryAssertion(hookCtx, cs, &chaosDetails)
-			log.Infof("[Observation]: end of fault window, before revert (recorded only, not graded): %s", why)
-		})
-		defer setMidChaosHook(nil)
+	var lifecycle *faultVerification
+	if !strings.HasPrefix(chaosDetails.ExperimentName, "uninstall-") {
+		var err error
+		lifecycle, err = prepareVerification(ctx, cs, &chaosDetails)
+		if err != nil {
+			log.Errorf("Chaos injection was not attempted, err: %v", err)
+			result.RecordAfterFailure(&chaosDetails, &resultDetails, friendlyError(err, cerrors.ErrorTypeTargetSelection), cs, &eventsDetails)
+			return
+		}
+		ctx = context.WithValue(ctx, verificationKey{}, lifecycle)
+		lifecycle.onChaos = func(hookCtx context.Context) error {
+			if len(resultDetails.ProbeDetails) == 0 {
+				return nil
+			}
+			return probe.RunProbes(hookCtx, &chaosDetails, cs, &resultDetails, "DuringChaos", &eventsDetails)
+		}
+		lifecycle.stopProbes = func() error {
+			if len(resultDetails.ProbeDetails) == 0 {
+				return nil
+			}
+			chaosDetails.ProbeContext.CancelFunc()
+			waitCtx, cancel := context.WithTimeout(context.Background(), RevertTimeout)
+			defer cancel()
+			return probe.WaitForBackgroundProbes(waitCtx, &resultDetails)
+		}
 	}
-
 	chaosDetails.Phase = types.ChaosInjectPhase
 	injectErr := inject(ctx, cs, &chaosDetails)
+	if lifecycle != nil {
+		injectErr = lifecycle.finish(ctx, injectErr)
+	}
 	if ctx.Err() != nil {
 		// Aborted. inject() has already reverted (its revert runs on RevertContext, which
 		// survives the cancellation), so the target is clean; record Stopped and stop.
 		if injectErr != nil {
 			log.Errorf("Chaos injection returned during abort, err: %v", injectErr)
 		}
-		log.Info("[Abort]: fault reverted -- recording Stopped verdict")
+		if lifecycle != nil && lifecycle.recoveryErr != nil {
+			result.RecordAfterFailure(&chaosDetails, &resultDetails, friendlyError(injectErr, cerrors.ErrorTypeChaosRevert), cs, &eventsDetails)
+			return
+		}
+		log.Info("[Abort]: recovery verified; recording Stopped verdict")
 		recordAbort(cs, &resultDetails, &chaosDetails, &eventsDetails)
 		return
 	}
 	if injectErr != nil {
 		log.Errorf("Chaos injection failed, err: %v", injectErr)
-		result.RecordAfterFailure(&chaosDetails, &resultDetails, injectErr, cs, &eventsDetails)
+		result.RecordAfterFailure(&chaosDetails, &resultDetails, friendlyError(injectErr, cerrors.ErrorTypeChaosInject), cs, &eventsDetails)
 		return
 	}
 
@@ -427,71 +277,103 @@ func Run(ctx context.Context, cs clients.ClientSets, inject InjectFunc) {
 // the chaos-operator populates from ChaosEngine.spec.appinfo. This is the real SDK
 // mechanism the itbench faults previously assumed existed as APP_NAMESPACE/APP_LABEL/
 // APP_KIND env vars (it doesn't -- see the fault-catalog investigation); TARGETS is.
-func ResolveTarget(ctx context.Context, cs clients.ClientSets, gvr schema.GroupVersionResource, chaosDetails *types.ChaosDetails) (*unstructured.Unstructured, error) {
-	if len(chaosDetails.AppDetail) == 0 {
-		return nil, fmt.Errorf("no target resolved: TARGETS env var was empty/unset (expected kind:namespace:label-or-[names])")
-	}
-	app := chaosDetails.AppDetail[0]
-	rc := cs.DynamicClient.Resource(gvr).Namespace(app.Namespace)
-
-	if len(app.Names) > 0 {
-		return rc.Get(ctx, strings.TrimSpace(app.Names[0]), metav1.GetOptions{})
-	}
-
-	sel := labels.Set{}
-	for _, l := range app.Labels {
-		kv := strings.SplitN(strings.TrimSpace(l), "=", 2)
-		if len(kv) == 2 {
-			sel[kv[0]] = kv[1]
-		}
-	}
-	list, err := rc.List(ctx, metav1.ListOptions{LabelSelector: sel.String()})
-	if err != nil {
-		return nil, fmt.Errorf("failed listing %s in ns=%s label=%s: %w", gvr.Resource, app.Namespace, sel.String(), err)
-	}
-	if len(list.Items) == 0 {
-		return nil, fmt.Errorf("no %s found in ns=%s matching label %s", gvr.Resource, app.Namespace, sel.String())
-	}
-	return &list.Items[0], nil
+func targetSelectionError(gvr schema.GroupVersionResource, app types.AppDetails, reason string) error {
+	return cerrors.Error{ErrorCode: cerrors.ErrorTypeTargetSelection,
+		Target: fmt.Sprintf("%s in namespace %s", gvr.Resource, app.Namespace), Reason: reason}
 }
 
-// ResolveTargets is ResolveTarget but returns every matching object (for faults that
-// operate on all matched pods rather than a single parent workload, e.g. the ephemeral-
-// container freeze fault).
-func ResolveTargets(ctx context.Context, cs clients.ClientSets, gvr schema.GroupVersionResource, chaosDetails *types.ChaosDetails) ([]unstructured.Unstructured, error) {
-	if len(chaosDetails.AppDetail) == 0 {
-		return nil, fmt.Errorf("no target resolved: TARGETS env var was empty/unset (expected kind:namespace:label-or-[names])")
-	}
-	app := chaosDetails.AppDetail[0]
-	rc := cs.DynamicClient.Resource(gvr).Namespace(app.Namespace)
-
-	if len(app.Names) > 0 {
-		var items []unstructured.Unstructured
-		for _, n := range app.Names {
-			obj, err := rc.Get(ctx, strings.TrimSpace(n), metav1.GetOptions{})
-			if err != nil {
-				return nil, err
-			}
-			items = append(items, *obj)
-		}
-		return items, nil
-	}
-
-	sel := labels.Set{}
-	for _, l := range app.Labels {
-		kv := strings.SplitN(strings.TrimSpace(l), "=", 2)
-		if len(kv) == 2 {
-			sel[kv[0]] = kv[1]
-		}
-	}
-	list, err := rc.List(ctx, metav1.ListOptions{LabelSelector: sel.String()})
+func ResolveTarget(ctx context.Context, cs clients.ClientSets, gvr schema.GroupVersionResource, details *types.ChaosDetails) (*unstructured.Unstructured, error) {
+	objects, err := ResolveTargets(ctx, cs, gvr, details)
 	if err != nil {
-		return nil, fmt.Errorf("failed listing %s in ns=%s label=%s: %w", gvr.Resource, app.Namespace, sel.String(), err)
+		return nil, err
 	}
-	if len(list.Items) == 0 {
-		return nil, fmt.Errorf("no %s found in ns=%s matching label %s", gvr.Resource, app.Namespace, sel.String())
+	if len(objects) != 1 {
+		return nil, targetSelectionError(gvr, details.AppDetail[0], fmt.Sprintf("expected exactly one target, found %d; choose a unique name or label selector", len(objects)))
 	}
-	return list.Items, nil
+	return &objects[0], nil
+}
+
+// ResolveTargets never broadens an empty selector to every object. A workload
+// name is resolved to its own pod selector when a pod-based fault needs its pods.
+func ResolveTargets(ctx context.Context, cs clients.ClientSets, gvr schema.GroupVersionResource, details *types.ChaosDetails) ([]unstructured.Unstructured, error) {
+	if len(details.AppDetail) != 1 {
+		return nil, targetSelectionError(gvr, types.AppDetails{}, "provide exactly one TARGETS entry with a namespace and names or labels")
+	}
+	app := details.AppDetail[0]
+	if strings.TrimSpace(app.Namespace) == "" {
+		return nil, targetSelectionError(gvr, app, "target namespace is required")
+	}
+	rc := cs.DynamicClient.Resource(gvr).Namespace(app.Namespace)
+	if len(app.Names) > 0 {
+		if len(app.Labels) > 0 {
+			return nil, targetSelectionError(gvr, app, "choose target names or labels, not both")
+		}
+		var objects []unstructured.Unstructured
+		seen := map[string]bool{}
+		for _, raw := range app.Names {
+			name := strings.TrimSpace(raw)
+			if name == "" {
+				return nil, targetSelectionError(gvr, app, "target names must not be empty")
+			}
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			if gvr == GVRPods && app.Kind != "pod" && app.Kind != "pods" {
+				workloadGVR, err := WorkloadGVRForKind(app.Kind)
+				if err != nil {
+					return nil, err
+				}
+				workload, err := cs.DynamicClient.Resource(workloadGVR).Namespace(app.Namespace).Get(ctx, name, metav1.GetOptions{})
+				if err != nil {
+					return nil, targetSelectionError(gvr, app, err.Error())
+				}
+				selector, found, err := unstructured.NestedMap(workload.Object, "spec", "selector")
+				if err != nil || !found {
+					return nil, targetSelectionError(gvr, app, "workload has no pod selector")
+				}
+				rawSelector := &metav1.LabelSelector{}
+				encoded, err := json.Marshal(selector)
+				if err == nil {
+					err = json.Unmarshal(encoded, rawSelector)
+				}
+				if err != nil {
+					return nil, targetSelectionError(gvr, app, "workload pod selector is invalid")
+				}
+				parsed, err := metav1.LabelSelectorAsSelector(rawSelector)
+				if err != nil || parsed.Empty() {
+					return nil, targetSelectionError(gvr, app, "workload pod selector is empty or invalid")
+				}
+				pods, err := rc.List(ctx, metav1.ListOptions{LabelSelector: parsed.String()})
+				if err != nil {
+					return nil, targetSelectionError(gvr, app, err.Error())
+				}
+				objects = append(objects, pods.Items...)
+				continue
+			}
+			object, err := rc.Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return nil, targetSelectionError(gvr, app, err.Error())
+			}
+			objects = append(objects, *object)
+		}
+		if len(objects) == 0 {
+			return nil, targetSelectionError(gvr, app, "no objects matched the requested target names")
+		}
+		return objects, nil
+	}
+	selector, err := labels.Parse(strings.Join(app.Labels, ","))
+	if err != nil || selector.Empty() {
+		return nil, targetSelectionError(gvr, app, "a valid, nonempty target label selector is required")
+	}
+	objects, err := rc.List(ctx, metav1.ListOptions{LabelSelector: selector.String()})
+	if err != nil {
+		return nil, targetSelectionError(gvr, app, err.Error())
+	}
+	if len(objects.Items) == 0 {
+		return nil, targetSelectionError(gvr, app, fmt.Sprintf("no %s match %s; install the required resource or choose an applicable target", gvr.Resource, selector.String()))
+	}
+	return objects.Items, nil
 }
 
 // JSONPatch applies an RFC 6902 JSON-patch document to the named namespaced object.

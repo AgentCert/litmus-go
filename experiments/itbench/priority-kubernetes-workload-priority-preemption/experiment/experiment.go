@@ -13,9 +13,10 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/litmuschaos/litmus-go/pkg/cerrors"
 	"github.com/litmuschaos/litmus-go/pkg/clients"
-	"github.com/litmuschaos/litmus-go/pkg/log"
 	itbench "github.com/litmuschaos/litmus-go/pkg/itbench/common"
+	"github.com/litmuschaos/litmus-go/pkg/log"
 	"github.com/litmuschaos/litmus-go/pkg/types"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -53,9 +54,37 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 	if err != nil || decoyMemPercent <= 0 || decoyMemPercent > 100 {
 		return fmt.Errorf("DECOY_MEMORY_PERCENT must be an integer in 1-100, got %q", os.Getenv("DECOY_MEMORY_PERCENT"))
 	}
-	decoyMemKi := allocMem.Value() / 1024 * int64(decoyMemPercent) / 100
-	decoyMemoryRequest := fmt.Sprintf("%dKi", decoyMemKi)
-	log.Infof("Node allocatable memory=%s; decoy will request %s (%d%%), pinned to node=%s", allocMemRaw, decoyMemoryRequest, decoyMemPercent, nodeName)
+	// The decoy has to be sized against what the node has left, not against a fixed
+	// share of its total: a fraction of allocatable fits in the free space of a large
+	// or lightly loaded node, so the scheduler simply places it and preempts nothing.
+	requested, err := requestedMemory(ctx, cs, nodeName)
+	if err != nil {
+		return err
+	}
+	targetRequest := podMemoryRequest(&pods[0])
+	if targetRequest <= 0 {
+		return cerrors.Error{ErrorCode: cerrors.ErrorTypeTargetSelection,
+			Target: fmt.Sprintf("pod %s in namespace %s", pods[0].GetName(), pods[0].GetNamespace()),
+			Reason: "target declares no memory request, so evicting it frees no capacity and the scheduler can never preempt it; choose a target with resources.requests.memory set"}
+	}
+	free := allocMem.Value() - requested
+	if free < 0 {
+		free = 0
+	}
+	// Strictly more than the free space (so it cannot simply be placed), and no more
+	// than the free space plus the target's own request (so evicting the target is
+	// enough to admit it).
+	decoyMemBytes := free + targetRequest
+	ceiling := allocMem.Value() / 100 * int64(decoyMemPercent)
+	if decoyMemBytes > ceiling {
+		return cerrors.Error{ErrorCode: cerrors.ErrorTypeTargetSelection,
+			Target: fmt.Sprintf("node %s", nodeName),
+			Reason: fmt.Sprintf("forcing preemption needs a decoy of %dMi but DECOY_MEMORY_PERCENT caps it at %dMi (%d%% of allocatable); free the node, choose a larger target, or raise DECOY_MEMORY_PERCENT",
+				decoyMemBytes/(1024*1024), ceiling/(1024*1024), decoyMemPercent)}
+	}
+	decoyMemoryRequest := fmt.Sprintf("%dKi", decoyMemBytes/1024)
+	log.Infof("Node allocatable=%dMi requested=%dMi free=%dMi; target requests %dMi, so the decoy requests %s to force its eviction (node=%s)",
+		allocMem.Value()/(1024*1024), requested/(1024*1024), free/(1024*1024), targetRequest/(1024*1024), decoyMemoryRequest, nodeName)
 
 	priorityClassName := os.Getenv("PRIORITY_CLASS_NAME")
 	// A PriorityClass with value 0 equals the default pod priority, so nothing is preempted.
@@ -113,6 +142,10 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 	if _, err := pcClient.Create(ctx, priorityClass, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("creating priorityclass: %w", err)
 	}
+	// The PriorityClass is cluster-scoped and the decoy outlives a namespace
+	// teardown, so both removals are asserted by the shared recovery check rather
+	// than trusted to a best-effort delete.
+	itbench.TrackTemporaryResource(ctx, itbench.GVRPriorityClasses, "", priorityClassName)
 	// Deferred from here on: the PriorityClass is cluster-scoped, so one left behind by a
 	// failed decoy create or an abort survives the namespace teardown and makes every later
 	// run fail with AlreadyExists.
@@ -125,11 +158,22 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 		}
 	}()
 
+	// The decoy is created after the server resolved the manifest's images, so it
+	// inherits this experiment's registry credentials rather than going without.
+	if self, err := itbench.ThisExperimentPod(ctx, cs); err == nil {
+		if podSpec := itbench.NestedObject(decoy.Object, "spec", "template", "spec"); podSpec != nil {
+			self.ApplyTo(podSpec, "")
+		}
+	} else {
+		log.Warnf("could not inherit registry credentials for the decoy (%v); it may fail to pull %s", err, decoyImage)
+	}
+
 	log.Infof("Injecting: creating decoy pressure Deployment %s in %s", decoyName, decoyNamespace)
 	decoyClient := cs.DynamicClient.Resource(itbench.GVRDeployments).Namespace(decoyNamespace)
 	if _, err := decoyClient.Create(ctx, decoy, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("creating decoy deployment: %w", err)
 	}
+	itbench.TrackTemporaryResource(ctx, itbench.GVRDeployments, decoyNamespace, decoyName)
 	defer func() {
 		revertCtx, cancel := itbench.RevertContext()
 		defer cancel()
@@ -144,6 +188,46 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 
 	itbench.HoldChaos(ctx, chaosDetails)
 	return nil
+}
+
+// requestedMemory totals the memory requests of every pod already placed on the node.
+// Terminated pods hold no capacity, so they are excluded.
+func requestedMemory(ctx context.Context, cs clients.ClientSets, nodeName string) (int64, error) {
+	pods, err := cs.DynamicClient.Resource(itbench.GVRPods).Namespace("").List(ctx, metav1.ListOptions{
+		FieldSelector: "spec.nodeName=" + nodeName,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("reading the pods already scheduled on node %s: %w", nodeName, err)
+	}
+	var total int64
+	for i := range pods.Items {
+		phase, _, _ := unstructured.NestedString(pods.Items[i].Object, "status", "phase")
+		if phase == "Succeeded" || phase == "Failed" {
+			continue
+		}
+		total += podMemoryRequest(&pods.Items[i])
+	}
+	return total, nil
+}
+
+// podMemoryRequest totals one pod's container memory requests, which is what the
+// scheduler reserves for it and therefore what evicting it would release.
+func podMemoryRequest(pod *unstructured.Unstructured) int64 {
+	containers, _, _ := unstructured.NestedSlice(pod.Object, "spec", "containers")
+	var total int64
+	for _, raw := range containers {
+		container, _ := raw.(map[string]interface{})
+		value, found, _ := unstructured.NestedString(container, "resources", "requests", "memory")
+		if !found {
+			continue
+		}
+		quantity, err := resource.ParseQuantity(value)
+		if err != nil {
+			continue
+		}
+		total += quantity.Value()
+	}
+	return total
 }
 
 func deleteDecoyPods(ctx context.Context, cs clients.ClientSets, namespace, decoyName string) error {

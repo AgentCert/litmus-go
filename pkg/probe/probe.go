@@ -405,3 +405,25 @@ func checkProbeTimeoutError(name string, code cerrors.ErrorType, probeErr error)
 	}
 	return probeErr
 }
+
+// WaitForBackgroundProbes joins cancelled Continuous/OnChaos probes before a
+// fault restores its target. Verdict evaluation still runs in PostChaos.
+func WaitForBackgroundProbes(ctx context.Context, result *types.ResultDetails) error {
+	for {
+		pending := false
+		for _, p := range result.ProbeDetails {
+			mode := strings.ToLower(p.Mode)
+			if (mode == "continuous" || mode == "onchaos") && !p.HasProbeCompleted {
+				pending = true
+			}
+		}
+		if !pending {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for during-chaos probes to stop: %w", ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}

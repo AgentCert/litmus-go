@@ -9,8 +9,8 @@ import (
 	"fmt"
 
 	"github.com/litmuschaos/litmus-go/pkg/clients"
-	"github.com/litmuschaos/litmus-go/pkg/log"
 	itbench "github.com/litmuschaos/litmus-go/pkg/itbench/common"
+	"github.com/litmuschaos/litmus-go/pkg/log"
 	"github.com/litmuschaos/litmus-go/pkg/types"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -37,6 +37,9 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 		return err
 	}
 	origUnschedulable, _, _ := unstructured.NestedBool(node.Object, "spec", "unschedulable")
+	if origUnschedulable {
+		return fmt.Errorf("cannot inject: node %s is already cordoned", nodeName)
+	}
 
 	log.Infof("Injecting: cordoning node %s", nodeName)
 	if err := setUnschedulable(ctx, cs, nodeName, true); err != nil {

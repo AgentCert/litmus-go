@@ -15,8 +15,8 @@ import (
 	"time"
 
 	"github.com/litmuschaos/litmus-go/pkg/clients"
-	"github.com/litmuschaos/litmus-go/pkg/log"
 	itbench "github.com/litmuschaos/litmus-go/pkg/itbench/common"
+	"github.com/litmuschaos/litmus-go/pkg/log"
 	"github.com/litmuschaos/litmus-go/pkg/types"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -56,7 +56,7 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 	generatorImage := os.Getenv("GENERATOR_IMAGE")
 
 	url := fmt.Sprintf("http://%s.%s.svc.cluster.local:%s%s", svcName, namespace, servicePort, requestPath)
-	genPodName := fmt.Sprintf("chaos-http-body-tamper-%d", time.Now().Unix())
+	genPodName := fmt.Sprintf("chaos-http-body-tamper-%d", time.Now().UnixNano())
 	log.Infof("Target service=%s port=%s path=%s", svcName, servicePort, requestPath)
 
 	pod := &unstructured.Unstructured{Object: map[string]interface{}{
@@ -80,7 +80,14 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 						map[string]interface{}{"name": "TAMPER_INTERVAL", "value": intervalSeconds},
 					},
 					"command": []string{"/bin/sh", "-c",
-						`while true; do curl -s -o /dev/null -w "%{http_code} " -X "$TAMPER_METHOD" -H "Content-Type: application/json" -d "$TAMPER_BODY" "$TAMPER_URL"; sleep "$TAMPER_INTERVAL"; done`,
+						`while true; do
+code=$(curl --connect-timeout 2 --max-time 5 -s -o /dev/null -w "%{http_code}" -X "$TAMPER_METHOD" -H "Content-Type: application/json" -d "$TAMPER_BODY" "$TAMPER_URL" || true)
+case "$code" in
+  [1-5][0-9][0-9]) printf '{"status":%s}\n' "$code" ;;
+  *) printf '{"status":0}\n' ;;
+esac
+sleep "$TAMPER_INTERVAL"
+done`,
 					},
 				},
 			},

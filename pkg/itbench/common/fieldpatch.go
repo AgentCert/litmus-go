@@ -74,44 +74,8 @@ func buildRevertOp(ctx context.Context, cs clients.ClientSets, gvr schema.GroupV
 // value at fieldPath inside target (nil if absent), JSON-patches jsonPointerPath to
 // newValue, holds for chaosDetails.ChaosDuration, then restores the original value (or
 // removes the field if it was absent beforehand).
-func applyFieldPatch(ctx context.Context, cs clients.ClientSets, chaosDetails *types.ChaosDetails, gvr schema.GroupVersionResource, namespace, name string, target *unstructured.Unstructured, fieldPath []string, jsonPointerPath string, newValue interface{}) error {
-	original, found := readNested(target.Object, fieldPath)
-
-	injectOp := jsonPatchOp{Op: "replace", Path: jsonPointerPath, Value: newValue}
-	if !found {
-		injectOp.Op = "add"
-	}
-	injectPatch, err := json.Marshal([]jsonPatchOp{injectOp})
-	if err != nil {
-		return err
-	}
-	log.Infof("Injecting: patching %s to %v", jsonPointerPath, newValue)
-	if err := JSONPatch(ctx, cs, gvr, namespace, name, injectPatch); err != nil {
-		return fmt.Errorf("patching %s: %w", jsonPointerPath, err)
-	}
-
-	HoldChaos(ctx, chaosDetails)
-
-	revertCtx, cancel := RevertContext()
-	defer cancel()
-
-	revertOp, skip, err := buildRevertOp(revertCtx, cs, gvr, namespace, name, fieldPath, jsonPointerPath, original, found)
-	if err != nil {
-		return err
-	}
-	if skip {
-		log.Infof("Reverting: %s already back to absent, nothing to do", jsonPointerPath)
-		return nil
-	}
-	revertPatch, err := json.Marshal([]jsonPatchOp{revertOp})
-	if err != nil {
-		return err
-	}
-	log.Infof("Reverting: restoring %s", jsonPointerPath)
-	if err := JSONPatch(revertCtx, cs, gvr, namespace, name, revertPatch); err != nil {
-		return fmt.Errorf("reverting %s: %w", jsonPointerPath, err)
-	}
-	return nil
+func applyFieldPatch(ctx context.Context, cs clients.ClientSets, details *types.ChaosDetails, gvr schema.GroupVersionResource, namespace, name string, target *unstructured.Unstructured, fieldPath []string, pointer string, value interface{}) error {
+	return applyMultiFieldPatch(ctx, cs, details, gvr, namespace, name, target, []FieldSpec{{Path: fieldPath, JSONPointerPath: pointer, NewValue: value}})
 }
 
 // FieldSpec is one field to patch as part of a multi-field atomic patch (e.g. command +
@@ -132,14 +96,27 @@ func applyMultiFieldPatch(ctx context.Context, cs clients.ClientSets, chaosDetai
 	}
 	origs := make([]captured, len(fields))
 	injectOps := make([]jsonPatchOp, len(fields))
+	changed := false
 	for i, f := range fields {
 		original, found := readNested(target.Object, f.Path)
 		origs[i] = captured{original, found}
+		before, marshalErr := json.Marshal(original)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		after, marshalErr := json.Marshal(f.NewValue)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		changed = changed || !found || string(before) != string(after)
 		op := "replace"
 		if !found {
 			op = "add"
 		}
 		injectOps[i] = jsonPatchOp{Op: op, Path: f.JSONPointerPath, Value: f.NewValue}
+	}
+	if len(fields) == 0 || !changed {
+		return fmt.Errorf("cannot inject: target already has the requested fault configuration")
 	}
 	injectPatch, err := json.Marshal(injectOps)
 	if err != nil {
@@ -156,6 +133,7 @@ func applyMultiFieldPatch(ctx context.Context, cs clients.ClientSets, chaosDetai
 	defer cancel()
 
 	var current *unstructured.Unstructured
+	var lookupErr error
 	var revertOps []jsonPatchOp
 	for i, f := range fields {
 		if origs[i].found {
@@ -166,12 +144,18 @@ func applyMultiFieldPatch(ctx context.Context, cs clients.ClientSets, chaosDetai
 		// server's typed round-trip can silently drop an empty slice/map back to
 		// "absent" (Go's `omitempty`) even though our own inject patch explicitly
 		// added it, which would make a blind "remove" fail (RFC 6902 requires the
-		// target to currently exist).
-		if current == nil {
-			current, err = cs.DynamicClient.Resource(gvr).Namespace(namespace).Get(revertCtx, name, metav1.GetOptions{})
-			if err != nil {
-				return fmt.Errorf("re-fetching %s/%s to check current state before revert: %w", gvr.Resource, name, err)
+		// target to currently exist). A failed lookup must not abort the revert:
+		// returning here would discard the restore ops already built for the other
+		// fields and leave the target mutated for good.
+		if current == nil && lookupErr == nil {
+			current, lookupErr = cs.DynamicClient.Resource(gvr).Namespace(namespace).Get(revertCtx, name, metav1.GetOptions{})
+			if lookupErr != nil {
+				log.Errorf("could not re-read %s/%s before revert (%v); removing injected fields unconditionally", gvr.Resource, name, lookupErr)
 			}
+		}
+		if current == nil {
+			revertOps = append(revertOps, jsonPatchOp{Op: "remove", Path: f.JSONPointerPath})
+			continue
 		}
 		if _, currentlyFound := readNested(current.Object, f.Path); currentlyFound {
 			revertOps = append(revertOps, jsonPatchOp{Op: "remove", Path: f.JSONPointerPath})
@@ -276,41 +260,7 @@ func MergeField(ctx context.Context, cs clients.ClientSets, gvr schema.GroupVers
 	}
 	merged[key] = value
 
-	op := "replace"
-	if !found {
-		op = "add"
-	}
-	injectPatch, err := json.Marshal([]jsonPatchOp{{Op: op, Path: jsonPointerPath, Value: merged}})
-	if err != nil {
-		return err
-	}
-	log.Infof("Injecting: merging %s=%v into %s", key, value, jsonPointerPath)
-	if err := JSONPatch(ctx, cs, gvr, namespace, name, injectPatch); err != nil {
-		return fmt.Errorf("patching %s: %w", jsonPointerPath, err)
-	}
-
-	HoldChaos(ctx, chaosDetails)
-
-	revertCtx, cancel := RevertContext()
-	defer cancel()
-
-	revertOp, skip, err := buildRevertOp(revertCtx, cs, gvr, namespace, name, fieldPath, jsonPointerPath, original, found)
-	if err != nil {
-		return err
-	}
-	if skip {
-		log.Infof("Reverting: %s already back to absent, nothing to do", jsonPointerPath)
-		return nil
-	}
-	revertPatch, err := json.Marshal([]jsonPatchOp{revertOp})
-	if err != nil {
-		return err
-	}
-	log.Infof("Reverting: restoring %s", jsonPointerPath)
-	if err := JSONPatch(revertCtx, cs, gvr, namespace, name, revertPatch); err != nil {
-		return fmt.Errorf("reverting %s: %w", jsonPointerPath, err)
-	}
-	return nil
+	return applyFieldPatch(ctx, cs, chaosDetails, gvr, namespace, name, target, fieldPath, jsonPointerPath, merged)
 }
 
 // MergeWorkloadMapField reads the current map at fieldPath on the target
@@ -344,41 +294,7 @@ func MergeWorkloadMapField(ctx context.Context, cs clients.ClientSets, chaosDeta
 	}
 	merged[key] = value
 
-	op := "replace"
-	if !found {
-		op = "add"
-	}
-	injectPatch, err := json.Marshal([]jsonPatchOp{{Op: op, Path: jsonPointerPath, Value: merged}})
-	if err != nil {
-		return err
-	}
-	log.Infof("Injecting: merging %s=%v into %s", key, value, jsonPointerPath)
-	if err := JSONPatch(ctx, cs, gvr, namespace, name, injectPatch); err != nil {
-		return fmt.Errorf("patching %s: %w", jsonPointerPath, err)
-	}
-
-	HoldChaos(ctx, chaosDetails)
-
-	revertCtx, cancel := RevertContext()
-	defer cancel()
-
-	revertOp, skip, err := buildRevertOp(revertCtx, cs, gvr, namespace, name, fieldPath, jsonPointerPath, original, found)
-	if err != nil {
-		return err
-	}
-	if skip {
-		log.Infof("Reverting: %s already back to absent, nothing to do", jsonPointerPath)
-		return nil
-	}
-	revertPatch, err := json.Marshal([]jsonPatchOp{revertOp})
-	if err != nil {
-		return err
-	}
-	log.Infof("Reverting: restoring %s", jsonPointerPath)
-	if err := JSONPatch(revertCtx, cs, gvr, namespace, name, revertPatch); err != nil {
-		return fmt.Errorf("reverting %s: %w", jsonPointerPath, err)
-	}
-	return nil
+	return applyFieldPatch(ctx, cs, chaosDetails, gvr, namespace, name, target, fieldPath, jsonPointerPath, merged)
 }
 
 // PatchWorkloadFields is PatchWorkloadField for multiple pod-template fields patched and

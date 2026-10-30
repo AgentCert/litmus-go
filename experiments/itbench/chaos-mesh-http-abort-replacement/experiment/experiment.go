@@ -10,10 +10,11 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/litmuschaos/litmus-go/pkg/clients"
-	"github.com/litmuschaos/litmus-go/pkg/log"
 	itbench "github.com/litmuschaos/litmus-go/pkg/itbench/common"
+	"github.com/litmuschaos/litmus-go/pkg/log"
 	"github.com/litmuschaos/litmus-go/pkg/types"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -25,15 +26,11 @@ func Run(ctx context.Context, cs clients.ClientSets) {
 }
 
 func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.ChaosDetails) (retErr error) {
-	if len(chaosDetails.AppDetail) == 0 || len(chaosDetails.AppDetail[0].Labels) == 0 {
-		return fmt.Errorf("no target label resolved: TARGETS env var was empty/unset or had no label selector")
+	selector, err := itbench.TargetPodSelector(ctx, cs, chaosDetails)
+	if err != nil {
+		return err
 	}
 	namespace := chaosDetails.AppDetail[0].Namespace
-	label := chaosDetails.AppDetail[0].Labels[0]
-	kv := strings.SplitN(label, "=", 2)
-	if len(kv) != 2 {
-		return fmt.Errorf("target label %q is not in key=value form", label)
-	}
 
 	// An empty/garbage TARGET_PORT matches no containerPort, so every port ends up in the
 	// "keep open" allow-list below and the policy blocks nothing while still reporting success.
@@ -60,8 +57,11 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 
 	netpolName := os.Getenv("NETPOL_NAME")
 	if netpolName == "" {
-		netpolName = fmt.Sprintf("itbench-http-abort-%s", strings.NewReplacer("/", "-", ".", "-").Replace(kv[1]))
+		netpolName = fmt.Sprintf("itbench-http-abort-%s", "target")
 	}
+
+	// Each run owns only its unique policy; never delete an existing user's policy.
+	netpolName = fmt.Sprintf("%.35s-%d", netpolName, time.Now().UnixNano())
 
 	var ingress []interface{}
 	if len(otherPorts) == 0 {
@@ -83,9 +83,7 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 			"labels":    map[string]interface{}{"litmuschaos.io/fault": "chaos-mesh-http-abort-replacement"},
 		},
 		"spec": map[string]interface{}{
-			"podSelector": map[string]interface{}{
-				"matchLabels": map[string]interface{}{kv[0]: kv[1]},
-			},
+			"podSelector": selector,
 			"policyTypes": []interface{}{"Ingress"},
 			"ingress":     ingress,
 		},
@@ -93,18 +91,11 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 
 	netpolClient := cs.DynamicClient.Resource(itbench.GVRNetworkPolicies).Namespace(namespace)
 
-	// The name is deterministic, so a policy left behind by an earlier aborted run would
-	// make every later run fail with AlreadyExists while the target stays blocked.
-	if err := netpolClient.Delete(ctx, netpolName, metav1.DeleteOptions{}); err == nil {
-		log.Infof("Cleared stale NetworkPolicy %s left by a previous run", netpolName)
-	} else if !k8serrors.IsNotFound(err) {
-		return fmt.Errorf("clearing stale networkpolicy %s: %w", netpolName, err)
-	}
-
-	log.Infof("Injecting: NetworkPolicy %s denies ingress on %s/%s to %s=%s in %s", netpolName, protocol, targetPort, kv[0], kv[1], namespace)
+	log.Infof("Injecting NetworkPolicy %s in %s", netpolName, namespace)
 	if _, err := netpolClient.Create(ctx, netpol, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("creating networkpolicy: %w", err)
 	}
+	itbench.TrackTemporaryResource(ctx, itbench.GVRNetworkPolicies, namespace, netpolName)
 	defer func() {
 		revertCtx, cancel := itbench.RevertContext()
 		defer cancel()

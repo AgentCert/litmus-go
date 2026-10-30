@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/litmuschaos/litmus-go/pkg/clients"
 	"github.com/litmuschaos/litmus-go/pkg/log"
 	"github.com/litmuschaos/litmus-go/pkg/types"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 // TargetContainerName resolves which container within the target pod template a
@@ -193,99 +195,60 @@ func MergeContainerMapField(ctx context.Context, cs clients.ClientSets, chaosDet
 // applied and reverted atomically in one patch. Unlike PatchContainerField (whole-value
 // replace), this preserves sibling keys already present in each map -- e.g. patching
 // resources.limits.memory without clobbering an existing resources.limits.cpu.
-func MergeContainerMapFields(ctx context.Context, cs clients.ClientSets, chaosDetails *types.ChaosDetails, specs []MapMergeSpec) error {
-	if len(chaosDetails.AppDetail) == 0 {
-		return fmt.Errorf("no target resolved: TARGETS env var was empty/unset")
-	}
-	gvr, err := WorkloadGVRForKind(chaosDetails.AppDetail[0].Kind)
+func MergeContainerMapFields(ctx context.Context, cs clients.ClientSets, details *types.ChaosDetails, specs []MapMergeSpec) error {
+	target, idx, _, err := ResolveTargetWorkloadAndContainer(ctx, cs, details)
 	if err != nil {
 		return err
 	}
-	target, idx, _, err := ResolveTargetWorkloadAndContainer(ctx, cs, chaosDetails)
+	gvr, err := WorkloadGVRForKind(details.AppDetail[0].Kind)
 	if err != nil {
 		return err
 	}
-	name, namespace := target.GetName(), target.GetNamespace()
-
-	type resolved struct {
-		jsonPointerPath string
-		revertPath      string
-		original        interface{}
-		found           bool
-		merged          map[string]interface{}
-	}
-	items := make([]resolved, len(specs))
-	var ancestorOps []jsonPatchOp
-	mainOps := make([]jsonPatchOp, len(specs))
-	for i, spec := range specs {
-		containerPath := []string{"spec", "template", "spec", "containers", fmt.Sprintf("%d", idx)}
-		nestedPath := append(append([]string{}, containerPath...), spec.Path...)
-		jsonPointerPath := fmt.Sprintf("/spec/template/spec/containers/%d/%s", idx, jsonPointerJoin(spec.Path))
-		original, found := readNested(target.Object, nestedPath)
-		merged := map[string]interface{}{}
-		if found {
-			if m, ok := original.(map[string]interface{}); ok {
-				for k, v := range m {
-					merged[k] = v
+	base := []string{"spec", "template", "spec", "containers", fmt.Sprint(idx)}
+	roots := map[string]map[string]interface{}{}
+	var order []string
+	for _, spec := range specs {
+		if len(spec.Path) == 0 || spec.Key == "" {
+			return fmt.Errorf("map merge requires a field path and key")
+		}
+		root := spec.Path[0]
+		value, exists := roots[root]
+		if !exists {
+			original, found := readNested(target.Object, append(append([]string{}, base...), root))
+			value = map[string]interface{}{}
+			if found {
+				copied, ok := runtime.DeepCopyJSONValue(original).(map[string]interface{})
+				if !ok {
+					return fmt.Errorf("%s must be an object", root)
 				}
+				value = copied
+			}
+			roots[root] = value
+			order = append(order, root)
+		}
+		nested := value
+		for _, key := range spec.Path[1:] {
+			child, present := nested[key]
+			if !present {
+				child = map[string]interface{}{}
+				nested[key] = child
+			}
+			var ok bool
+			nested, ok = child.(map[string]interface{})
+			if !ok {
+				return fmt.Errorf("map merge parent %s is not an object", key)
 			}
 		}
-		merged[spec.Key] = spec.Value
-
-		op := "replace"
-		revertPath := jsonPointerPath
-		if !found {
-			op = "add"
-			// RFC 6902 "add" requires the parent to exist, so materialize any absent
-			// ancestor (e.g. resources when patching resources/limits) first, and revert
-			// by removing the shallowest one we created -- which takes the subtree with it.
-			for d := 1; d < len(spec.Path); d++ {
-				if _, ok := readNested(target.Object, append(append([]string{}, containerPath...), spec.Path[:d]...)); ok {
-					continue
-				}
-				ancestorPointer := fmt.Sprintf("/spec/template/spec/containers/%d/%s", idx, jsonPointerJoin(spec.Path[:d]))
-				ancestorOps = append(ancestorOps, jsonPatchOp{Op: "add", Path: ancestorPointer, Value: map[string]interface{}{}})
-				if revertPath == jsonPointerPath {
-					revertPath = ancestorPointer
-				}
-			}
-		}
-		items[i] = resolved{jsonPointerPath, revertPath, original, found, merged}
-		mainOps[i] = jsonPatchOp{Op: op, Path: jsonPointerPath, Value: merged}
+		nested[spec.Key] = spec.Value
 	}
-	injectOps := append(ancestorOps, mainOps...)
-
-	injectPatch, err := json.Marshal(injectOps)
-	if err != nil {
-		return err
+	fields := make([]FieldSpec, 0, len(order))
+	for _, root := range order {
+		path := append(append([]string{}, base...), root)
+		fields = append(fields, FieldSpec{Path: path, JSONPointerPath: "/" + jsonPointerJoin(path), NewValue: roots[root]})
 	}
-	log.Infof("Injecting: merging %d map field(s)", len(specs))
-	if err := JSONPatch(ctx, cs, gvr, namespace, name, injectPatch); err != nil {
-		return fmt.Errorf("patching fields: %w", err)
-	}
-
-	HoldChaos(ctx, chaosDetails)
-
-	revertCtx, cancel := RevertContext()
-	defer cancel()
-
-	revertOps := make([]jsonPatchOp, len(items))
-	for i, it := range items {
-		if it.found {
-			revertOps[i] = jsonPatchOp{Op: "replace", Path: it.jsonPointerPath, Value: it.original}
-		} else {
-			revertOps[i] = jsonPatchOp{Op: "remove", Path: it.revertPath}
-		}
-	}
-	revertPatch, err := json.Marshal(revertOps)
-	if err != nil {
-		return err
-	}
-	log.Infof("Reverting: restoring %d map field(s)", len(specs))
-	if err := JSONPatch(revertCtx, cs, gvr, namespace, name, revertPatch); err != nil {
-		return fmt.Errorf("reverting fields: %w", err)
-	}
-	return nil
+	// Capture each shared parent once. Cleanup cannot remove the same ancestor
+	// twice, and the ordinary multi-field restoration handles API omitempty.
+	return applyMultiFieldPatch(ctx, cs, details, gvr, target.GetNamespace(), target.GetName(), target, fields)
 }
 
 // AppendAndRemoveInitContainer resolves the target Deployment/StatefulSet via TARGETS,
@@ -293,62 +256,8 @@ func MergeContainerMapFields(ctx context.Context, cs clients.ClientSets, chaosDe
 // entirely absent), holds for chaosDetails.ChaosDuration, then removes exactly that
 // appended entry by the index it landed at -- any pre-existing init containers are left
 // untouched. Shared shape behind the crashing/hanging init-container faults.
-func AppendAndRemoveInitContainer(ctx context.Context, cs clients.ClientSets, chaosDetails *types.ChaosDetails, initContainer map[string]interface{}) error {
-	if len(chaosDetails.AppDetail) == 0 {
-		return fmt.Errorf("no target resolved: TARGETS env var was empty/unset")
-	}
-	gvr, err := WorkloadGVRForKind(chaosDetails.AppDetail[0].Kind)
-	if err != nil {
-		return err
-	}
-	target, err := ResolveTarget(ctx, cs, gvr, chaosDetails)
-	if err != nil {
-		return err
-	}
-	name, namespace := target.GetName(), target.GetNamespace()
-
-	existing, found, err := unstructured.NestedSlice(target.Object, "spec", "template", "spec", "initContainers")
-	if err != nil {
-		return err
-	}
-	origCount := 0
-	if found {
-		origCount = len(existing)
-	}
-	log.Infof("Target resolved: %s/%s (ns=%s), existing initContainers=%d", gvr.Resource, name, namespace, origCount)
-
-	var injectPatch []byte
-	if origCount == 0 {
-		// JSON Patch "add .../initContainers/-" requires the array to already exist;
-		// when there are no pre-existing init containers the field may be entirely
-		// absent, so create it as a single-element array instead.
-		injectPatch, err = json.Marshal([]jsonPatchOp{{Op: "add", Path: "/spec/template/spec/initContainers", Value: []interface{}{initContainer}}})
-	} else {
-		injectPatch, err = json.Marshal([]jsonPatchOp{{Op: "add", Path: "/spec/template/spec/initContainers/-", Value: initContainer}})
-	}
-	if err != nil {
-		return err
-	}
-	log.Infof("Injecting: appending initContainer %v", initContainer["name"])
-	if err := JSONPatch(ctx, cs, gvr, namespace, name, injectPatch); err != nil {
-		return fmt.Errorf("appending initContainer: %w", err)
-	}
-
-	HoldChaos(ctx, chaosDetails)
-
-	revertCtx, cancel := RevertContext()
-	defer cancel()
-
-	removePath := fmt.Sprintf("/spec/template/spec/initContainers/%d", origCount)
-	log.Infof("Reverting: removing appended initContainer at index %d", origCount)
-	revertPatch, err := json.Marshal([]jsonPatchOp{{Op: "remove", Path: removePath}})
-	if err != nil {
-		return err
-	}
-	if err := JSONPatch(revertCtx, cs, gvr, namespace, name, revertPatch); err != nil {
-		return fmt.Errorf("removing appended initContainer: %w", err)
-	}
-	return nil
+func AppendAndRemoveInitContainer(ctx context.Context, cs clients.ClientSets, details *types.ChaosDetails, item map[string]interface{}) error {
+	return AppendAndRemoveWorkloadArrayItems(ctx, cs, details, []ArrayAppendSpec{{Path: []string{"spec", "template", "spec", "initContainers"}, Item: item}})
 }
 
 // ArrayAppendSpec is one "append Item to the array at Path" operation for
@@ -378,56 +287,35 @@ func AppendAndRemoveWorkloadArrayItems(ctx context.Context, cs clients.ClientSet
 	}
 	name, namespace := target.GetName(), target.GetNamespace()
 
-	origCounts := make([]int, len(specs))
-	injectOps := make([]jsonPatchOp, len(specs))
-	for i, spec := range specs {
-		// readNested (not unstructured.NestedSlice) because spec.Path may contain a
-		// numeric array-index segment (e.g. containers/<idx>/volumeMounts) --
-		// unstructured's own Nested* helpers only navigate map[string]interface{} at
-		// every level and error out on an array segment.
-		existingRaw, found := readNested(target.Object, spec.Path)
-		var existing []interface{}
+	fields := make([]FieldSpec, 0, len(specs))
+	seen := map[string]bool{}
+	for _, spec := range specs {
+		pointer := "/" + jsonPointerJoin(spec.Path)
+		if seen[pointer] {
+			return fmt.Errorf("duplicate array patch path %s", pointer)
+		}
+		seen[pointer] = true
+		raw, found := readNested(target.Object, spec.Path)
+		var items []interface{}
 		if found {
-			existing, found = existingRaw.([]interface{})
+			var ok bool
+			items, ok = raw.([]interface{})
+			if !ok {
+				return fmt.Errorf("%s must be an array", pointer)
+			}
 		}
-		if found {
-			origCounts[i] = len(existing)
+		if added, ok := spec.Item.(map[string]interface{}); ok && added["name"] != nil {
+			for _, raw := range items {
+				existing, _ := raw.(map[string]interface{})
+				if existing["name"] == added["name"] {
+					return fmt.Errorf("%s already contains an item named %v", pointer, added["name"])
+				}
+			}
 		}
-		pointerPath := "/" + jsonPointerJoin(spec.Path)
-		if origCounts[i] == 0 {
-			injectOps[i] = jsonPatchOp{Op: "add", Path: pointerPath, Value: []interface{}{spec.Item}}
-		} else {
-			injectOps[i] = jsonPatchOp{Op: "add", Path: pointerPath + "/-", Value: spec.Item}
-		}
+		updated := append(append([]interface{}{}, items...), spec.Item)
+		fields = append(fields, FieldSpec{Path: spec.Path, JSONPointerPath: pointer, NewValue: updated})
 	}
-	injectPatch, err := json.Marshal(injectOps)
-	if err != nil {
-		return err
-	}
-	log.Infof("Injecting: appending %d array item(s)", len(specs))
-	if err := JSONPatch(ctx, cs, gvr, namespace, name, injectPatch); err != nil {
-		return fmt.Errorf("appending array items: %w", err)
-	}
-
-	HoldChaos(ctx, chaosDetails)
-
-	revertCtx, cancel := RevertContext()
-	defer cancel()
-
-	revertOps := make([]jsonPatchOp, len(specs))
-	for i, spec := range specs {
-		pointerPath := fmt.Sprintf("/%s/%d", jsonPointerJoin(spec.Path), origCounts[i])
-		revertOps[i] = jsonPatchOp{Op: "remove", Path: pointerPath}
-	}
-	revertPatch, err := json.Marshal(revertOps)
-	if err != nil {
-		return err
-	}
-	log.Infof("Reverting: removing %d appended array item(s)", len(specs))
-	if err := JSONPatch(revertCtx, cs, gvr, namespace, name, revertPatch); err != nil {
-		return fmt.Errorf("removing appended array items: %w", err)
-	}
-	return nil
+	return applyMultiFieldPatch(ctx, cs, chaosDetails, gvr, namespace, name, target, fields)
 }
 
 func jsonPointerJoin(path []string) string {
@@ -436,7 +324,7 @@ func jsonPointerJoin(path []string) string {
 		if i > 0 {
 			out += "/"
 		}
-		out += p
+		out += strings.NewReplacer("~", "~0", "/", "~1").Replace(p)
 	}
 	return out
 }

@@ -10,8 +10,8 @@ import (
 	"os"
 
 	"github.com/litmuschaos/litmus-go/pkg/clients"
-	"github.com/litmuschaos/litmus-go/pkg/log"
 	itbench "github.com/litmuschaos/litmus-go/pkg/itbench/common"
+	"github.com/litmuschaos/litmus-go/pkg/log"
 	"github.com/litmuschaos/litmus-go/pkg/types"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -47,6 +47,9 @@ func inject(ctx context.Context, cs clients.ClientSets, chaosDetails *types.Chao
 	if _, err := pvcClient.Create(ctx, pvc, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("creating pvc: %w", err)
 	}
+	// Makes the PVC's removal part of the shared recovery assertion, so a cleanup
+	// that silently failed cannot still be reported as a recovered run.
+	itbench.TrackTemporaryResource(ctx, itbench.GVRPersistentVolumeClaim, namespace, pvcName)
 	// Deferred: the PVC name is derived from the workload name, so one left behind by a
 	// failed patch or an abort makes every later run fail with AlreadyExists.
 	defer func() {
